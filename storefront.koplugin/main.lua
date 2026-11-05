@@ -819,12 +819,13 @@ local function isReleaseIgnored(owner, repo_name, version)
 end
 
 
-local extractRepoOwner, ensureCacheDir, ensurePatchesDir, downloadToFile, buildPatchDownloadUrl, derivePluginRepoPath, fetchGitHubRaw, formatTimestamp, buildRepoDescriptorFromRecord, buildBranchCandidates, getRepoDefaultBranch, extractMetaField, getInstallRecordsMap, getPatchRecordsMap, listInstalledPatches, buildPatchRecordFields, buildPatchSummary, extractPluginToUserDir, extractReleaseNameFallback, detectPluginFromArchiveWithFallback, renderReleaseNotesText
+local extractRepoOwner, ensureCacheDir, ensurePatchesDir, downloadToFile, buildPatchDownloadUrl, derivePluginRepoPath, fetchGitHubRaw, formatTimestamp, buildRepoDescriptorFromRecord, buildBranchCandidates, getRepoDefaultBranch, extractMetaField, getInstallRecordsMap, getPatchRecordsMap, listInstalledPatches, buildPatchRecordFields, buildPatchSummary, extractPluginToUserDir, extractReleaseNameFallback, detectPluginFromArchiveWithFallback, renderReleaseNotesText, getRecordedInstall, findCachedPatchFile
 
 getPatchRecordsMap = storefront_patch_mgr.getPatchRecordsMap
 listInstalledPatches = storefront_patch_mgr.listInstalledPatches
 buildPatchRecordFields = storefront_patch_mgr.buildPatchRecordFields
 buildPatchSummary = storefront_patch_mgr.buildPatchSummary
+findCachedPatchFile = storefront_patch_mgr.findCachedPatchFile
 
 
 local function buildPatchRepoDescriptor(record)
@@ -1109,8 +1110,9 @@ local function computeFileSha1(path)
         return nil
     end
     local ok_lfs2, lfs2 = pcall(require, "libs/libkoreader-lfs")
-    local fsize = ok_lfs2 and lfs2 and lfs2.attributes and lfs2.attributes(path, "size")
-    if fsize and fsize > MAX_SHA1_FILE_BYTES then
+    local attr_size = ok_lfs2 and lfs2 and lfs2.attributes and lfs2.attributes(path, "size")
+    local fsize = type(attr_size) == "table" and (attr_size.size or attr_size[1]) or attr_size
+    if fsize and type(fsize) == "number" and fsize > MAX_SHA1_FILE_BYTES then
         return nil
     end
     local file = io.open(path, "rb")
@@ -1363,17 +1365,19 @@ local function buildMetaPathCandidates(record)
     end
 
     if record.dirname and record.dirname ~= "" then
-        add("plugins/" .. record.dirname .. "/_meta.lua")
         add(record.dirname .. "/_meta.lua")
+        add("_meta.lua")
         if record.dirname:match("%.koplugin$") then
             local without_suffix = record.dirname:gsub("%.koplugin$", "")
-            add("plugins/" .. without_suffix .. "/_meta.lua")
             add(without_suffix .. "/_meta.lua")
+            add("plugins/" .. without_suffix .. "/_meta.lua")
         end
+        add("plugins/" .. record.dirname .. "/_meta.lua")
+    else
+        add("_meta.lua")
     end
 
     add("plugins/_meta.lua")
-    add("_meta.lua")
 
     return candidates
 end
@@ -1474,7 +1478,7 @@ local function getRepoOwner(repo)
     end
 end
 
-local function getRepoDefaultBranch(repo)
+getRepoDefaultBranch = function(repo)
     return (repo and repo.data and repo.data.default_branch)
         or (repo and repo.default_branch)
         or "HEAD"
@@ -1667,7 +1671,7 @@ local function findInstalledPatch(filename)
     end
 end
 
-local function getInstallRecordsMap(sf)
+getInstallRecordsMap = function(sf)
     if sf and type(sf) == "table" and type(sf.getInstallRecordsMap) == "function" and sf.getInstallRecordsMap ~= Storefront.getInstallRecordsMap then
         return sf:getInstallRecordsMap()
     end
@@ -1816,15 +1820,28 @@ function Storefront:populateRemoteInfoFromCatalog()
                     or (cached_repo.data and (cached_repo.data.version or cached_repo.data.tag_name or cached_repo.data.latest_version))
                 local cat_published = cat_rel and cat_rel.published_at
 
+                if cat_tag and isPreReleaseTag(cat_tag) and not allow_prerelease then
+                    cat_tag = nil
+                end
+
                 if cat_tag then
-                    remote_info[plugin.dirname] = {
-                        remote_version = cat_tag:gsub("^[vV]", ""),
-                        release_tag_name = cat_tag,
-                        release_published_at = cat_published and parseGitHubTimestamp(cat_published) or 0,
-                        last_checked = os.time(),
-                        is_cached_fallback = true,
-                    }
-                    updated_count = updated_count + 1
+                    local existing = remote_info[plugin.dirname]
+                    local should_set = not existing
+                        or existing.is_cached_fallback
+                        or existing.error ~= nil
+                        or not existing.release_tag_name
+                        or isVersionNewer(cat_tag, existing.release_tag_name)
+
+                    if should_set then
+                        remote_info[plugin.dirname] = {
+                            remote_version = cat_tag:gsub("^[vV]", ""),
+                            release_tag_name = cat_tag,
+                            release_published_at = cat_published and parseGitHubTimestamp(cat_published) or 0,
+                            last_checked = os.time(),
+                            is_cached_fallback = true,
+                        }
+                        updated_count = updated_count + 1
+                    end
                 else
                     if remote_info[plugin.dirname] and remote_info[plugin.dirname].is_cached_fallback then
                         remote_info[plugin.dirname] = nil
@@ -1836,7 +1853,9 @@ function Storefront:populateRemoteInfoFromCatalog()
     end
 
     self.updates_state.remote_info = remote_info
-    self.updates_state.last_checked = os.time()
+    if updated_count > 0 or not self.updates_state.last_checked or self.updates_state.last_checked == 0 then
+        self.updates_state.last_checked = os.time()
+    end
     self:saveUpdatesState()
     self._cached_plugin_summary = nil
     self._merged_updates_cache = nil
@@ -1941,8 +1960,9 @@ end
 
 function Storefront:collectPatchUpdateSummary()
     self:ensurePatchUpdatesState()
+    local cat_patch_fetched = (Cache and Cache.getLastFetched and Cache.getLastFetched("patch")) or 0
     local current_generation = InstallStore.getGeneration and InstallStore.getGeneration() or 0
-    local remote_info_key = self.patch_updates_state and self.patch_updates_state.last_checked
+    local remote_info_key = tostring(self.patch_updates_state and self.patch_updates_state.last_checked or 0) .. ":" .. tostring(cat_patch_fetched)
     
     if self._cached_patch_summary
        and self._cached_patch_summary_gen == current_generation
@@ -1981,8 +2001,14 @@ end
 
 function Storefront:collectUpdateSummary()
     self:ensureUpdatesState()
+    local cat_plugin_fetched = (Cache and Cache.getLastFetched and Cache.getLastFetched("plugin")) or 0
+    if cat_plugin_fetched > 0 and self._last_catalog_populated_ts ~= cat_plugin_fetched then
+        self._last_catalog_populated_ts = cat_plugin_fetched
+        pcall(function() self:populateRemoteInfoFromCatalog() end)
+    end
+
     local current_generation = InstallStore.getGeneration and InstallStore.getGeneration() or 0
-    local remote_info_key = self.updates_state and self.updates_state.last_checked
+    local remote_info_key = tostring(self.updates_state and self.updates_state.last_checked or 0) .. ":" .. tostring(cat_plugin_fetched)
 
     if self._cached_plugin_summary
        and self._cached_plugin_summary_gen == current_generation
@@ -2184,14 +2210,22 @@ function Storefront:collectUpdateSummary()
         
         local has_update = false
 
-        if tracked and record and record.source == "branch" and remote then
-            local remote_sha = remote.remote_version
+        if tracked and record and record.source == "branch" then
+            local remote_sha = remote and remote.remote_version
             local installed_sha = record.sha
             local is_valid_sha = remote_sha and type(remote_sha) == "string" and remote_sha:match("^%x%x%x%x%x%x%x+$")
-            if not remote.is_cached_fallback and is_valid_sha and installed_sha and installed_sha ~= "" then
+            if not installed_sha or installed_sha == "" then
+                has_update = true
+            elseif remote and not remote.is_cached_fallback and is_valid_sha then
                 has_update = isShaDifferent(remote_sha, installed_sha)
             else
                 has_update = false
+            end
+            if has_update then
+                local item_k = plugin.dirname or (record and (record.owner and record.repo and (record.owner .. "/" .. record.repo) or record.repo))
+                if item_k and InstallStore.isAllUpdatesIgnored(item_k) then
+                    has_update = false
+                end
             end
         elseif tracked and remote then
             local release_tag = remote.release_tag_name
@@ -3184,7 +3218,43 @@ end
 
 
 
-function Storefront:_scanUpdatesForDirectApi(tracked)
+function Storefront:_scanUpdatesForDirectApi(tracked, tracked_patches)
+    tracked = tracked or {}
+    tracked_patches = tracked_patches or {}
+
+    local worker_tracked = {}
+    -- Pre-attach catalog metadata to avoid disk I/O in subprocess without mutating original records
+    for _, orig_rec in ipairs(tracked) do
+        local rec = {}
+        for k, v in pairs(orig_rec) do rec[k] = v end
+        local cached_repo = (rec.repo_id and Cache.getRepo(rec.repo_id))
+            or (rec.owner and rec.repo and Cache.getRepoByName(rec.owner, rec.repo))
+        if cached_repo then
+            rec.in_catalog = true
+            local rel = cached_repo.latest_release or (cached_repo.data and cached_repo.data.latest_release)
+            local pre = cached_repo.latest_prerelease or (cached_repo.data and cached_repo.data.latest_prerelease)
+            rec.cached_latest_release = rel and rel.tag_name
+            rec.cached_latest_prerelease = pre and pre.tag_name
+            rec.cached_version = cached_repo.version or (cached_repo.data and cached_repo.data.version)
+            rec.cached_default_branch = cached_repo.default_branch or (cached_repo.data and cached_repo.data.default_branch)
+            rec.cached_pushed_at = cached_repo.pushed_at or (cached_repo.data and cached_repo.data.pushed_at)
+        end
+        table.insert(worker_tracked, rec)
+    end
+
+    local worker_patches = {}
+    for _, orig_prec in ipairs(tracked_patches) do
+        local prec = {}
+        for k, v in pairs(orig_prec) do prec[k] = v end
+        if prec.filename then
+            local _, cached_file = findCachedPatchFile and findCachedPatchFile(prec, prec.filename)
+            if cached_file and cached_file.sha then
+                prec.cached_sha = cached_file.sha
+            end
+        end
+        table.insert(worker_patches, prec)
+    end
+
     NetworkMgr:runWhenOnline(function()
         local Trapper = require("ui/trapper")
         local ltn12 = require("ltn12")
@@ -3233,16 +3303,22 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
             local url = string.format("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo_name, branch, path)
             local response = {}
             local http_mod = getHttpModule(url)
+            local headers = {
+                ["User-Agent"] = "KOReader-Storefront",
+                ["Accept"] = "text/plain",
+            }
+            local token = GitHub.getToken and GitHub.getToken()
+            if token and token ~= "" then
+                local scheme = (StorefrontConfig and StorefrontConfig.auth and StorefrontConfig.auth.github and StorefrontConfig.auth.github.scheme) or "token"
+                headers["Authorization"] = string.format("%s %s", scheme, token)
+            end
             local code
-            socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+            socketutil:set_timeout(5, 10)
             pcall(function()
                 _, code = http_mod.request{
                     url = url,
                     sink = ltn12.sink.table(response),
-                    headers = {
-                        ["User-Agent"] = "KOReader-Storefront",
-                        ["Accept"] = "text/plain",
-                    },
+                    headers = headers,
                 }
             end)
             socketutil:reset_timeout()
@@ -3334,23 +3410,28 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
             end
 
             if record.dirname and record.dirname ~= "" then
-                add("plugins/" .. record.dirname .. "/_meta.lua")
                 add(record.dirname .. "/_meta.lua")
+                add("_meta.lua")
                 if record.dirname:match("%.koplugin$") then
                     local without_suffix = record.dirname:gsub("%.koplugin$", "")
-                    add("plugins/" .. without_suffix .. "/_meta.lua")
                     add(without_suffix .. "/_meta.lua")
+                    add("plugins/" .. without_suffix .. "/_meta.lua")
                 end
+                add("plugins/" .. record.dirname .. "/_meta.lua")
+            else
+                add("_meta.lua")
             end
 
             add("plugins/_meta.lua")
-            add("_meta.lua")
 
             return candidates
         end
 
         local function runCheckAllUpdatesWorker(records_worker)
             local result = {}
+            local rate_limited = false
+            GitHub.setRequestTimeouts(5, 10)
+
             for _, record in ipairs(records_worker or {}) do
                 local dirname = record.dirname
                 local owner = record.owner
@@ -3360,18 +3441,29 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
                 local release_tag_name
                 local release_published_at
                 local last_err
+                local migrated_source, migrated_branch, migrated_sha
+                local updated_meta_path
 
                 if not owner or not repo_name then
                     last_err = "Missing repository info."
                 elseif record.source == "branch" and record.branch then
                     local branch_name = record.branch
-                    local head_sha = GitHub.fetchBranchSHA(owner, repo_name, branch_name)
-                    if head_sha and head_sha ~= "" then
-                        remote_version = head_sha
-                        release_tag_name = branch_name .. "@" .. head_sha:sub(1, 7)
-                        last_err = nil
+                    if rate_limited then
+                        last_err = "API rate limit reached; using catalog data."
                     else
-                        last_err = "Could not fetch branch SHA."
+                        local head_sha, sha_err = GitHub.fetchBranchSHA(owner, repo_name, branch_name)
+                        if head_sha and head_sha ~= "" then
+                            remote_version = head_sha
+                            release_tag_name = branch_name .. "@" .. head_sha:sub(1, 7)
+                            last_err = nil
+                        else
+                            if GitHub.isRateLimitError(sha_err) then
+                                rate_limited = true
+                                last_err = "API rate limit reached; using catalog data."
+                            else
+                                last_err = "Could not fetch branch SHA."
+                            end
+                        end
                     end
                 else
                     local is_storefront_worker = dirname == "storefront.koplugin"
@@ -3384,7 +3476,12 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
                         end
                     end
                     local allow_prerelease = allow_beta_worker or isPreReleaseAllowedForPlugin(nil, record, dirname)
-                    if allow_prerelease then
+
+                    if rate_limited then
+                        release_tag_name = (allow_prerelease and record.cached_latest_prerelease) or record.cached_latest_release or record.cached_version
+                        release_published_at = parseGitHubTimestampWorker(record.cached_pushed_at)
+                        last_err = "API rate limit reached; using catalog data."
+                    elseif allow_prerelease then
                         local releases, fetch_err = GitHub.fetchReleases(owner, repo_name, {
                             per_page = 10,
                             max_pages = 1,
@@ -3397,123 +3494,130 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
                                     break
                                 end
                             end
+                        elseif GitHub.isRateLimitError(fetch_err) then
+                            rate_limited = true
+                            release_tag_name = record.cached_latest_prerelease or record.cached_latest_release or record.cached_version
+                            release_published_at = parseGitHubTimestampWorker(record.cached_pushed_at)
+                            last_err = "API rate limit reached; using catalog data."
                         end
-                    end
-
-                    -- Check live GitHub release if not found via prerelease check
-                    if not release_tag_name then
-                        local latest_release, release_err = GitHub.fetchLatestRelease(owner, repo_name)
-                        if latest_release and latest_release.tag_name then
-                            if not latest_release.prerelease and not latest_release.draft then
-                                local tag_lower = latest_release.tag_name:lower()
-                                local is_prerelease_tag = tag_lower:find("alpha", 1, true) or 
-                                                          tag_lower:find("beta", 1, true) or 
-                                                          tag_lower:find("rc", 1, true) or 
-                                                          tag_lower:find("dev", 1, true) or 
-                                                          tag_lower:find("preview", 1, true) or 
-                                                          tag_lower:find("test", 1, true)
-                                if not is_prerelease_tag then
+                    else
+                        local is_releaseless = record.in_catalog and not record.cached_latest_release and not record.installed_tag and not record.tag_name
+                        if not is_releaseless then
+                            local latest_release, release_err = GitHub.fetchLatestRelease(owner, repo_name)
+                            if latest_release and latest_release.tag_name then
+                                if not latest_release.prerelease and not latest_release.draft and not isPreReleaseTag(latest_release.tag_name) then
                                     release_tag_name = latest_release.tag_name
                                     release_published_at = parseGitHubTimestampWorker(latest_release.published_at)
-                                end
-                            end
-                        end
-                    end
-
-                    if not release_tag_name then
-                        local releases, fetch_err = GitHub.fetchReleases(owner, repo_name, {
-                            per_page = 30,
-                            max_pages = 1,
-                        })
-                        if releases and #releases > 0 then
-                            for _, release in ipairs(releases) do
-                                if not release.draft and not release.prerelease then
-                                    local tag_lower = release.tag_name:lower()
-                                    local is_prerelease_tag = tag_lower:find("alpha", 1, true) or 
-                                                              tag_lower:find("beta", 1, true) or 
-                                                              tag_lower:find("rc", 1, true) or 
-                                                              tag_lower:find("dev", 1, true) or 
-                                                              tag_lower:find("preview", 1, true) or 
-                                                              tag_lower:find("test", 1, true)
-                                    if not is_prerelease_tag then
-                                        release_tag_name = release.tag_name
-                                        release_published_at = parseGitHubTimestampWorker(release.published_at)
-                                        break
+                                else
+                                    local releases, rel_err = GitHub.fetchReleases(owner, repo_name, {
+                                        per_page = 10,
+                                        max_pages = 1,
+                                    })
+                                    if releases and #releases > 0 then
+                                        for _, rel in ipairs(releases) do
+                                            if not rel.draft and not rel.prerelease and not isPreReleaseTag(rel.tag_name) then
+                                                release_tag_name = rel.tag_name
+                                                release_published_at = parseGitHubTimestampWorker(rel.published_at)
+                                                break
+                                            end
+                                        end
+                                    elseif GitHub.isRateLimitError(rel_err) then
+                                        rate_limited = true
                                     end
                                 end
+                            elseif GitHub.isRateLimitError(release_err) then
+                                rate_limited = true
+                                release_tag_name = record.cached_latest_release or record.cached_version
+                                release_published_at = parseGitHubTimestampWorker(record.cached_pushed_at)
+                                last_err = "API rate limit reached; using catalog data."
                             end
                         end
                     end
 
-                    -- Fallback to static catalog cache if live GitHub releases fetch returned nothing
-                    if not release_tag_name then
-                        local cached_repo = Cache.getRepoByName(owner, repo_name) or (record.repo_id and Cache.getRepo(record.repo_id))
-                        if cached_repo then
-                            local rel = cached_repo.latest_release or (cached_repo.data and cached_repo.data.latest_release)
-                            if rel and rel.tag_name then
-                                release_tag_name = rel.tag_name
-                                release_published_at = parseGitHubTimestampWorker(rel.published_at)
-                            end
-                            if not release_tag_name and cached_repo.version then
-                                release_tag_name = cached_repo.version
-                            end
-                            local ts = cached_repo.data and (cached_repo.data.pushed_at or cached_repo.data.created_at)
-                            remote_repo_ts = parseGitHubTimestampWorker(ts)
+                    -- Fallback to pre-attached catalog release if live check returned nothing
+                    if not release_tag_name and not rate_limited then
+                        if record.cached_latest_release or record.cached_version then
+                            release_tag_name = (allow_prerelease and record.cached_latest_prerelease) or record.cached_latest_release or record.cached_version
+                            release_published_at = parseGitHubTimestampWorker(record.cached_pushed_at)
                         end
                     end
 
-                    local metadata, metadata_err = GitHub.fetchRepoMetadata(owner, repo_name)
-                    if metadata and type(metadata) == "table" then
-                        local ts = metadata.pushed_at or metadata.created_at
-                        remote_repo_ts = parseGitHubTimestampWorker(ts)
+                    -- Fetch repo metadata ONLY when release_tag_name was not found
+                    local branch = record.branch or record.cached_default_branch
+                    if not release_tag_name and not rate_limited then
+                        if not branch or branch == "" then
+                            local metadata, metadata_err = GitHub.fetchRepoMetadata(owner, repo_name)
+                            if metadata and type(metadata) == "table" then
+                                local ts = metadata.pushed_at or metadata.created_at
+                                remote_repo_ts = parseGitHubTimestampWorker(ts)
+                                branch = metadata.default_branch or metadata.master_branch or "HEAD"
+                            elseif GitHub.isRateLimitError(metadata_err) then
+                                rate_limited = true
+                                last_err = "API rate limit reached; using catalog data."
+                            end
+                        end
                     end
 
                     if release_tag_name then
-                        last_err = nil
+                        last_err = rate_limited and "API rate limit reached; using catalog data." or nil
                     else
-                        local meta_path = record.meta_path
-                        if (not meta_path or meta_path == "") and dirname and dirname ~= "" then
-                            meta_path = dirname .. "/_meta.lua"
-                        end
-
-                        local branch = record.branch
-                        if (not branch or branch == "") and metadata and type(metadata) == "table" then
-                            branch = metadata.default_branch or metadata.master_branch or "HEAD"
-                        end
-
-                        local candidates = buildMetaPathCandidatesWorker and buildMetaPathCandidatesWorker(record) or {}
-                        if #candidates == 0 and meta_path then
-                            table.insert(candidates, meta_path)
-                        end
-
-                        local found_body = nil
-                        local working_meta_path = nil
-                        for _, candidate in ipairs(candidates) do
-                            local body, err = fetchGitHubRawWorker(owner, repo_name, branch, candidate)
-                            if body then
-                                found_body = body
-                                working_meta_path = candidate
+                        branch = branch or "HEAD"
+                        local has_installed_tag = record.installed_tag or record.tag_name
+                        if not has_installed_tag and not rate_limited and branch ~= "HEAD" then
+                            local head_sha, sha_err = GitHub.fetchBranchSHA(owner, repo_name, branch)
+                            if head_sha and head_sha ~= "" then
+                                remote_version = head_sha
+                                release_tag_name = branch .. "@" .. head_sha:sub(1, 7)
+                                migrated_source = "branch"
+                                migrated_branch = branch
+                                migrated_sha = nil
                                 last_err = nil
-                                break
-                            else
-                                last_err = err or last_err
+                            elseif GitHub.isRateLimitError(sha_err) then
+                                rate_limited = true
                             end
                         end
 
-                        if found_body then
-                            local version = extractMetaFieldWorker(found_body, "version")
-                            if version then
-                                remote_version = version
-                                last_err = nil
-                                if working_meta_path and working_meta_path ~= record.meta_path then
-                                    record.meta_path = working_meta_path
-                                    pcall(function() InstallStore.upsert(dirname, record) end)
+                        if not release_tag_name and not remote_version then
+                            local meta_path = record.meta_path
+                            if (not meta_path or meta_path == "") and dirname and dirname ~= "" then
+                                meta_path = dirname .. "/_meta.lua"
+                            end
+
+                            local candidates = buildMetaPathCandidatesWorker and buildMetaPathCandidatesWorker(record) or {}
+                            if #candidates == 0 and meta_path then
+                                table.insert(candidates, meta_path)
+                            end
+
+                            local found_body = nil
+                            local working_meta_path = nil
+                            if not rate_limited then
+                                for _, candidate in ipairs(candidates) do
+                                    local body, err = fetchGitHubRawWorker(owner, repo_name, branch, candidate)
+                                    if body then
+                                        found_body = body
+                                        working_meta_path = candidate
+                                        last_err = nil
+                                        break
+                                    else
+                                        last_err = err or last_err
+                                    end
+                                end
+                            end
+
+                            if found_body then
+                                local version = extractMetaFieldWorker(found_body, "version")
+                                if version then
+                                    remote_version = version
+                                    last_err = nil
+                                    if working_meta_path then
+                                        updated_meta_path = working_meta_path
+                                    end
+                                else
+                                    last_err = "Remote version not found."
                                 end
                             else
-                                last_err = "Remote version not found."
+                                last_err = last_err or "Missing meta path in record."
                             end
-                        else
-                            last_err = last_err or "Missing meta path in record."
                         end
                     end
                 end
@@ -3523,25 +3627,122 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
                         remote_version = (type(remote_version) == "string") and remote_version or nil,
                         remote_repo_ts = tonumber(remote_repo_ts) or 0,
                         release_tag_name = (type(release_tag_name) == "string") and release_tag_name or nil,
-                        release_published_at = (type(release_published_at) == "string") and release_published_at or nil,
+                        release_published_at = tonumber(release_published_at) or (type(release_published_at) == "string" and parseGitHubTimestampWorker(release_published_at)) or 0,
                         error = (type(last_err) == "string") and last_err or (last_err and tostring(last_err) or nil),
                         last_checked = os.time(),
+                        migrated_source = migrated_source,
+                        migrated_branch = migrated_branch,
+                        migrated_sha = migrated_sha,
+                        updated_meta_path = updated_meta_path,
                     }
+                end
+            end
+            GitHub.resetRequestTimeouts()
+            return result, rate_limited
+        end
+
+        local function runCheckPatchUpdatesWorker(patch_records, rate_limited)
+            local result = {}
+            local repo_cache = {}
+
+            for _, record in ipairs(patch_records or {}) do
+                local filename = record.filename
+                local owner = record.owner
+                local repo_name = record.repo
+                local branch = record.branch or "HEAD"
+                local path = record.path
+                local cached_sha = record.cached_sha
+
+                if not filename then
+                    -- skip
+                elseif not owner or not repo_name or not path then
+                    result[filename] = {
+                        remote_sha = cached_sha,
+                        error = "Missing repository metadata for patch.",
+                        last_checked = os.time(),
+                    }
+                elseif rate_limited then
+                    result[filename] = {
+                        remote_sha = cached_sha,
+                        error = "API rate limit reached; using catalog data.",
+                        last_checked = os.time(),
+                    }
+                else
+                    local cache_key = string.format("%s/%s@%s", owner:lower(), repo_name:lower(), branch)
+                    local tree_map = repo_cache[cache_key]
+                    local fetch_err = nil
+
+                    if not tree_map and repo_cache[cache_key] ~= false then
+                        local tree, err = GitHub.fetchRepoTree(owner, repo_name, branch)
+                        if tree and type(tree.tree) == "table" then
+                            tree_map = {}
+                            for _, node in ipairs(tree.tree) do
+                                if node.type == "blob" and node.path then
+                                    tree_map[node.path] = node
+                                end
+                            end
+                            repo_cache[cache_key] = tree_map
+                        else
+                            fetch_err = err
+                            if GitHub.isRateLimitError(err) then
+                                rate_limited = true
+                            end
+                            repo_cache[cache_key] = false
+                        end
+                    end
+
+                    if tree_map then
+                        local node = tree_map[path]
+                        if node then
+                            result[filename] = {
+                                remote_sha = node.sha,
+                                download_url = string.format("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo_name, branch, path),
+                                last_checked = os.time(),
+                                error = nil,
+                            }
+                        else
+                            result[filename] = {
+                                remote_sha = cached_sha,
+                                error = "Patch file not found in repository.",
+                                last_checked = os.time(),
+                            }
+                        end
+                    else
+                        result[filename] = {
+                            remote_sha = cached_sha,
+                            error = rate_limited and "API rate limit reached; using catalog data." or (fetch_err and tostring(fetch_err) or "Failed to fetch patch tree."),
+                            last_checked = os.time(),
+                        }
+                    end
                 end
             end
             return result
         end
 
+        local progress_msg = (#tracked == 0 and #tracked_patches > 0)
+            and _("Checking patch updates…")
+            or _("Checking plugin updates…")
+
         local Toast = require("storefront_toast")
-        local progress_toast = Toast.show(_("Checking plugin updates…"), 0)
+        local progress_toast = Toast.show(progress_msg, 0, { show_cancel = true })
 
         Trapper:wrap(function()
             local completed, remote_info_result = Trapper:dismissableRunInSubprocess(function()
-                local ok, res = pcall(runCheckAllUpdatesWorker, tracked)
+                local ok, res = pcall(function()
+                    local plugins_res, rate_limited = runCheckAllUpdatesWorker(worker_tracked)
+                    local patches_res = nil
+                    if #worker_patches > 0 then
+                        patches_res = runCheckPatchUpdatesWorker(worker_patches, rate_limited)
+                    end
+                    return {
+                        plugins = plugins_res or {},
+                        patches = patches_res or {},
+                    }
+                end)
                 if ok and type(res) == "table" then
                     return res
                 end
-                return {}
+                return { plugins = {}, patches = {} }
             end, progress_toast)
 
             if progress_toast and progress_toast.close then
@@ -3549,20 +3750,68 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
             end
 
             if not completed then
-                Toast.show(_("Update check was cancelled."), 3)
+                UIManager:nextTick(function()
+                    Toast.show(_("Update check was cancelled."), 3)
+                end)
                 return
             end
 
             self:ensureUpdatesState()
             local remote_info = self.updates_state.remote_info or {}
-            for dirname, data in pairs(remote_info_result or {}) do
-                remote_info[dirname] = data
+            local plugins_res = remote_info_result and remote_info_result.plugins or {}
+            for dirname, data in pairs(plugins_res) do
+                local prev = remote_info[dirname]
+                if data.error and (not data.remote_version and not data.release_tag_name) and prev and (prev.remote_version or prev.release_tag_name) then
+                    prev.error = data.error
+                    prev.last_checked = data.last_checked or os.time()
+                else
+                    remote_info[dirname] = data
+                end
+                if data.migrated_source == "branch" and data.migrated_branch then
+                    local record = getRecordedInstall(dirname)
+                    if record then
+                        record.source = "branch"
+                        record.branch = data.migrated_branch
+                        if data.migrated_sha then
+                            record.sha = data.migrated_sha
+                        end
+                        InstallStore.upsert(dirname, record)
+                    end
+                end
+                if data.updated_meta_path then
+                    local record = getRecordedInstall(dirname)
+                    if record and record.meta_path ~= data.updated_meta_path then
+                        record.meta_path = data.updated_meta_path
+                        record.meta_path_verified = true
+                        InstallStore.upsert(dirname, record)
+                    end
+                end
             end
             self.updates_state.remote_info = remote_info
-            self.updates_state.last_checked = os.time()
-            
-            StorefrontLogger.action(string.format("REMOTE UPDATE CHECK FINISHED: %d records processed", #tracked))
-            for dirname, data in pairs(remote_info_result or {}) do
+            if #tracked > 0 then
+                self.updates_state.last_checked = os.time()
+            end
+
+            local patches_res = remote_info_result and remote_info_result.patches or {}
+            local patch_count = 0
+            for _ in pairs(patches_res) do patch_count = patch_count + 1 end
+            if patch_count > 0 then
+                self:ensurePatchUpdatesState()
+                local patch_remote = self.patch_updates_state.remote_info or {}
+                for filename, pdata in pairs(patches_res) do
+                    patch_remote[filename] = pdata
+                end
+                self.patch_updates_state.remote_info = patch_remote
+                self.patch_updates_state.last_checked = os.time()
+                self:savePatchUpdatesState()
+                self._cached_patch_summary = nil
+                if self.patch_updates_menu then
+                    self:updatePatchUpdatesDialog()
+                end
+            end
+
+            StorefrontLogger.action(string.format("REMOTE UPDATE CHECK FINISHED: %d plugins, %d patches processed", #tracked, patch_count))
+            for dirname, data in pairs(plugins_res) do
                 local msg = string.format(
                     "REMOTE UPDATE CHECK RECORD: %s -> tag=%s, remote_version=%s, err=%s",
                     tostring(dirname),
@@ -3581,11 +3830,17 @@ function Storefront:_scanUpdatesForDirectApi(tracked)
             self._cached_plugin_summary = nil
             self._merged_updates_cache = nil
             self:updateUpdatesDialog()
-            self:refreshCurrentBrowserTab()
             self:saveUpdatesState()
-            
-            local checked_count = #tracked
-            Toast.show(string.format(_("Checked %d plugin(s) for updates."), checked_count), 3)
+
+            local toast_msg
+            if #tracked == 0 and patch_count > 0 then
+                toast_msg = string.format(_("Checked %d patches: %d need updates, %d up to date."), patch_count, 0, patch_count)
+            else
+                toast_msg = string.format(_("Checked %d plugin(s) for updates."), #tracked)
+            end
+            self:refreshCurrentBrowserTab(function()
+                Toast.show(toast_msg, 3)
+            end)
         end)
     end)
 end
@@ -3612,6 +3867,7 @@ local function findLatestRelease(owner, repo, allow_prerelease)
                 end
             end
         end
+        return nil, fetch_err or "No releases found"
     end
 
     local latest, err = GitHub.fetchLatestRelease(owner, repo)
@@ -3622,26 +3878,24 @@ local function findLatestRelease(owner, repo, allow_prerelease)
                 return latest, nil
             end
         end
-    end
 
-    local releases, fetch_err = GitHub.fetchReleases(owner, repo, {
-        per_page = 30,
-        max_pages = 1,
-    })
-
-    if not releases or #releases == 0 then
-        return nil, fetch_err or err or "No releases found"
-    end
-
-    for _, release in ipairs(releases) do
-        if not release.draft and not release.prerelease then
-            if not isPreReleaseTag(release.tag_name) then
-                return release, nil
+        local releases, fetch_err = GitHub.fetchReleases(owner, repo, {
+            per_page = 10,
+            max_pages = 1,
+        })
+        if releases and #releases > 0 then
+            for _, release in ipairs(releases) do
+                if not release.draft and not release.prerelease then
+                    if not isPreReleaseTag(release.tag_name) then
+                        return release, nil
+                    end
+                end
             end
         end
+        return nil, fetch_err or "No stable release found"
     end
 
-    return nil, "No stable release found"
+    return nil, err or "No releases found"
 end
 
 -- Pure network-fetching core of fetchRemoteVersionForRecord below -- touches
@@ -4083,14 +4337,16 @@ function Storefront:promptUpdateAction(plugin, record)
         end,
     })
 
-    table.insert(other_buttons_row2, {
-        text = _("Delete plugin"),
-        background = Blitbuffer.COLOR_WHITE,
-        callback = function()
-            UIManager:close(info_box)
-            self:deletePlugin(plugin.dirname, record)
-        end,
-    })
+    if not isDefaultPlugin(plugin) then
+        table.insert(other_buttons_row2, {
+            text = _("Delete plugin"),
+            background = Blitbuffer.COLOR_WHITE,
+            callback = function()
+                UIManager:close(info_box)
+                self:deletePlugin(plugin.dirname, record)
+            end,
+        })
+    end
 
     info_box = ConfirmBox:new{
         text = plugin.name or plugin.dirname,
@@ -4664,7 +4920,9 @@ function Storefront:_checkSinglePluginInternal(record)
         end
 
         if not completed then
-            Toast.show(_("Update check was cancelled."), 3)
+            UIManager:nextTick(function()
+                Toast.show(_("Update check was cancelled."), 3)
+            end)
             return
         end
         if type(result) ~= "table" then
@@ -4697,9 +4955,9 @@ function Storefront:_checkSinglePluginInternal(record)
         if err then
             message = string.format(_("Failed to check %s: %s"), display_name, err)
         elseif record.source == "branch" and record.branch then
-            local short_remote = remote_version and remote_version:sub(1, 7) or ""
-            local short_installed = record.sha and record.sha:sub(1, 7) or ""
-            if remote_version and record.sha and isShaDifferent(remote_version, record.sha) then
+            local short_remote = (remote_version and remote_version ~= "") and remote_version:sub(1, 7) or _("unknown")
+            local short_installed = (record.sha and record.sha ~= "") and record.sha:sub(1, 7) or _("unknown")
+            if not record.sha or record.sha == "" or (remote_version and isShaDifferent(remote_version, record.sha)) then
                 message = string.format(_("Update available for %s (%s): %s → %s."), display_name, record.branch, short_installed, short_remote)
             else
                 message = string.format(_("%s is up to date on branch %s (%s)."), display_name, record.branch, short_installed)
@@ -4748,7 +5006,7 @@ function Storefront:updatePluginFromRecord(record)
 end
 
 
-local function getRecordedInstall(dirname)
+getRecordedInstall = function(dirname)
     if not dirname or dirname == "" then
         return nil
     end
@@ -4795,7 +5053,7 @@ function Storefront:rememberPatchInstall(filename, repo, patch_info)
     end
 end
 
-function Storefront:updateSinglePatchStatus(filename, record)
+function Storefront:updateSinglePatchStatus(filename, record, remote_sha_override)
     if not filename or filename == "" then
         return
     end
@@ -4808,12 +5066,16 @@ function Storefront:updateSinglePatchStatus(filename, record)
     local download_url = record.download_url
         or buildPatchDownloadUrl(record.owner, record.repo, record.branch or "HEAD", record.path)
     remote_info[filename] = {
-        remote_sha = record.sha,
+        remote_sha = remote_sha_override or record.sha,
         download_url = download_url,
         error = nil,
         last_checked = os.time(),
     }
     self.patch_updates_state.remote_info = remote_info
+    self:savePatchUpdatesState()
+    self._cached_patch_summary = nil
+    self._merged_updates_cache = nil
+    self._cached_updates_count = nil
 
     if self.patch_updates_menu then
         local scroll = self.patch_updates_menu.getScrollOffset and self.patch_updates_menu:getScrollOffset()
@@ -4823,8 +5085,6 @@ function Storefront:updateSinglePatchStatus(filename, record)
         end
     end
 end
-
-local derivePluginRepoPath
 
 function Storefront:rememberInstall(info, repo)
     if not info or not info.plugin_dirname then
@@ -4900,14 +5160,36 @@ fetchGitHubRaw = function(owner, repo_name, branch, path)
     branch = branch or "HEAD"
     local url = string.format("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo_name, branch, path)
     local response = {}
-    local _, code = http.request{
-        url = url,
-        sink = ltn12.sink.table(response),
-        headers = {
-            ["User-Agent"] = "KOReader-Storefront",
-            ["Accept"] = "text/plain",
-        },
+    local http_mod = http
+    if url:match("^https://") then
+        local ok_https, https = pcall(require, "ssl.https")
+        if ok_https and https then http_mod = https end
+    end
+    local headers = {
+        ["User-Agent"] = "KOReader-Storefront",
+        ["Accept"] = "text/plain",
     }
+    local token = GitHub and GitHub.getToken and GitHub.getToken()
+    if token and token ~= "" then
+        local scheme = (StorefrontConfig and StorefrontConfig.auth and StorefrontConfig.auth.github and StorefrontConfig.auth.github.scheme) or "token"
+        headers["Authorization"] = string.format("%s %s", scheme, token)
+    end
+    local ok_su, socketutil = pcall(require, "socketutil")
+    if ok_su and socketutil and socketutil.set_timeout then
+        socketutil:set_timeout(5, 10)
+    end
+    local code
+    pcall(function()
+        local _
+        _, code = http_mod.request{
+            url = url,
+            sink = ltn12.sink.table(response),
+            headers = headers,
+        }
+    end)
+    if ok_su and socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
     code = tonumber(code)
     if code ~= 200 then
         return nil, string.format("HTTP %s", tostring(code))
@@ -5669,7 +5951,7 @@ local function isPatchFilename(filename)
     return filename:match("^%d+%-.+%.lua$") ~= nil
 end
 
-local function buildPatchDownloadUrl(owner, repo_name, branch, path)
+buildPatchDownloadUrl = function(owner, repo_name, branch, path)
     if not owner or not repo_name or not path then
         return nil
     end
@@ -7190,7 +7472,7 @@ function Storefront:buildInstalledEntries(available_list_height)
                     if short_sha and short_sha ~= "" then
                         table.insert(kind_parts, string.format(_("branch: %s (%s)"), record.branch, short_sha))
                     else
-                        table.insert(kind_parts, string.format(_("branch: %s"), record.branch))
+                        table.insert(kind_parts, string.format(_("branch: %s (%s)"), record.branch, _("unknown")))
                     end
                 end
                 local meta_kind = table.concat(kind_parts, " · ")
@@ -7338,17 +7620,21 @@ function Storefront:buildInstalledEntries(available_list_height)
                             description = record and record.repo_description or "",
                             stars = 0,
                         }
+                        local remote_entry = self.patch_updates_state and self.patch_updates_state.remote_info and self.patch_updates_state.remote_info[patch.filename]
                         local patch_entry = {
                             filename = patch.filename,
-                            path = patch.path,
+                            path = (record and record.path) or patch.path,
                             display_path = record and record.path or patch.path,
+                            download_url = (remote_entry and remote_entry.download_url) or (record and record.download_url),
+                            branch = record and record.branch or "HEAD",
+                            sha = (remote_entry and remote_entry.remote_sha) or (record and record.sha),
                         }
                         local details_dialog = DetailsDialog:new{
                             Storefront = self,
                             repo = repo,
                             patch = patch_entry,
                             kind = "patch",
-                            update_item = { patch = patch, record = record, needs_update = has_update },
+                            update_item = { patch = patch, record = record, remote_entry = remote_entry, needs_update = has_update },
                         }
                         details_dialog:show()
                     end,
@@ -7595,6 +7881,7 @@ function Storefront:hasActiveFilters(tab)
         local sm = self.installed_state.sort_mode or "name_asc"
         return st ~= "" or ft ~= "all" or fd ~= "all" or fs ~= "all" or sm ~= "name_asc"
     elseif tab == "Screensavers" then
+        local col = self.browser_state and self.browser_state.screensaver_collection
         local cat = (self.browser_state and self.browser_state.screensaver_category or ""):lower()
         local cats = self.browser_state and self.browser_state.screensaver_categories
         local has_cats = type(cats) == "table" and next(cats) and not cats["all"]
@@ -7603,7 +7890,7 @@ function Storefront:hasActiveFilters(tab)
         local st = util.trim(self.browser_state and self.browser_state.search_text or "")
         local ow = util.trim(self.browser_state and self.browser_state.owner or "")
         local srch = (self.browser_state and self.browser_state.screensaver_search or ""):lower()
-        return has_cats or (cat ~= "" and cat ~= "all") or (sort ~= "featured") or (st ~= "") or (ow ~= "") or (srch ~= "")
+        return (col ~= nil and col ~= "") or has_cats or (cat ~= "" and cat ~= "all") or (sort ~= "featured") or (st ~= "") or (ow ~= "") or (srch ~= "")
     elseif tab == "Updates" then
         return false
     else
@@ -7639,6 +7926,7 @@ function Storefront:clearSearchAndFilters()
     self.browser_state.sort_mode = "stars_desc"
     self.browser_state.screensaver_category = ""
     self.browser_state.screensaver_categories = nil
+    self.browser_state.screensaver_collection = nil
     self.browser_state.page = 1
     self.browser_state.scroll_offset = nil
 
@@ -7670,6 +7958,26 @@ function Storefront:filterAndSortScreensavers(catalog, opts)
     local ss_sort = opts.ss_sort or "featured"
     if ss_sort == "az" or ss_sort == "za" then ss_sort = "featured" end
 
+    local ss_col_id = opts.screensaver_collection or (self.browser_state and self.browser_state.screensaver_collection)
+    local col_item_order = nil
+    if ss_col_id and ss_col_id ~= "" then
+        local StorefrontScreensavers = require("storefront_screensavers_ui")
+        local collections = StorefrontScreensavers.getCachedCollections() or {}
+        local found_col = nil
+        for _, c in ipairs(collections) do
+            if c.id == ss_col_id then
+                found_col = c
+                break
+            end
+        end
+        if found_col and found_col.items then
+            col_item_order = {}
+            for pos, id in ipairs(found_col.items) do
+                col_item_order[tostring(id)] = pos
+            end
+        end
+    end
+
     local search_terms = extractSearchTerms(raw_search)
     local owner_term   = normalizedLower(raw_owner)
 
@@ -7680,7 +7988,7 @@ function Storefront:filterAndSortScreensavers(catalog, opts)
     local liveRatings = (ok_ratings and StorefrontRatings and StorefrontRatings.liveRatings) or nil
     local has_live = liveRatings and (next(liveRatings) ~= nil)
 
-    if ss_sort == "featured" and both_sources_active and is_category_empty and (not search_terms or #search_terms == 0) and owner_term == "" then
+    if not col_item_order and ss_sort == "featured" and both_sources_active and is_category_empty and (not search_terms or #search_terms == 0) and owner_term == "" then
         local copy = {}
         for idx, entry in ipairs(catalog) do
             entry._catalog_index = entry._catalog_index or idx
@@ -7703,6 +8011,13 @@ function Storefront:filterAndSortScreensavers(catalog, opts)
             end
         else
             if active_sources.storefront == false then
+                pass = false
+            end
+        end
+
+        -- 0a. Collection membership filter
+        if pass and col_item_order then
+            if not col_item_order[tostring(entry.id)] then
                 pass = false
             end
         end
@@ -7829,7 +8144,6 @@ function Storefront:filterAndSortScreensavers(catalog, opts)
         local scores = {}
         local titles = {}
         for _, entry in ipairs(list) do
-            local live_r = has_live and (liveRatings[entry.id] or (entry.name and liveRatings[entry.name])) or nil
             dl_scores[entry] = (live_r and live_r.downloads) or entry.downloads or entry.download_count or entry.downloads_count or entry.installs or 0
             scores[entry] = (live_r and (live_r.up - live_r.down)) or entry.likes or 0
             titles[entry] = entry._title_lower or (entry.title or entry.name or ""):lower()
@@ -7977,6 +8291,17 @@ function Storefront:filterAndSortScreensavers(catalog, opts)
         end
     end
 
+    if col_item_order and ss_sort == "featured" then
+        table.sort(filtered, function(a, b)
+            local oa = col_item_order[tostring(a.id)] or 999
+            local ob = col_item_order[tostring(b.id)] or 999
+            if oa ~= ob then return oa < ob end
+            local ca = a._catalog_index or 0
+            local cb = b._catalog_index or 0
+            return ca < cb
+        end)
+    end
+
     return filtered
 end
 
@@ -8003,6 +8328,7 @@ function Storefront:warmupScreensaversCache()
     local raw_owner  = util.trim(self.browser_state.owner or "")
     local active_sources = self.browser_state.screensaver_sources or { storefront = true, readerbackdrop = true }
 
+    local ss_col = tostring(self.browser_state.screensaver_collection or "")
     local cats_key = ""
     if type(ss_cats) == "table" then
         local cat_keys = {}
@@ -8013,9 +8339,9 @@ function Storefront:warmupScreensaversCache()
         cats_key = table.concat(cat_keys, ",")
     end
     local src_key_str = string.format("sf:%s,rb:%s", tostring(active_sources.storefront ~= false), tostring(active_sources.readerbackdrop ~= false))
-    local ss_cache_key = string.format("%s|%s|%s|%s|%s|%s|%d",
+    local ss_cache_key = string.format("%s|%s|%s|%s|%s|%s|%s|%d",
         src_key_str, tostring(ss_cat), cats_key, tostring(ss_sort),
-        tostring(raw_search), tostring(raw_owner), #self.screensavers_cache)
+        tostring(raw_search), tostring(raw_owner), ss_col, #self.screensavers_cache)
 
     local filtered = self:filterAndSortScreensavers(self.screensavers_cache, {
         active_sources = active_sources,
@@ -8024,6 +8350,7 @@ function Storefront:warmupScreensaversCache()
         raw_search = raw_search,
         raw_owner = raw_owner,
         ss_sort = ss_sort,
+        screensaver_collection = ss_col,
     })
 
     self._filtered_screensavers_cache = {
@@ -8103,6 +8430,7 @@ function Storefront:buildScreensaverEntries(available_list_height, available_lis
     local raw_search = util.trim((self.browser_state.search_text and self.browser_state.search_text ~= "") and self.browser_state.search_text or (self.browser_state.screensaver_search or ""))
     local raw_owner  = util.trim(self.browser_state.owner or "")
 
+    local ss_col = tostring(self.browser_state.screensaver_collection or "")
     local cats_key = ""
     if type(ss_cats) == "table" then
         local cat_keys = {}
@@ -8114,9 +8442,9 @@ function Storefront:buildScreensaverEntries(available_list_height, available_lis
     end
     local active_sources = self.browser_state.screensaver_sources or { storefront = true, readerbackdrop = true }
     local src_key_str = string.format("sf:%s,rb:%s", tostring(active_sources.storefront ~= false), tostring(active_sources.readerbackdrop ~= false))
-    local ss_cache_key = string.format("%s|%s|%s|%s|%s|%s|%d",
+    local ss_cache_key = string.format("%s|%s|%s|%s|%s|%s|%s|%d",
         src_key_str, tostring(ss_cat), cats_key, tostring(ss_sort),
-        tostring(raw_search), tostring(raw_owner), #catalog)
+        tostring(raw_search), tostring(raw_owner), ss_col, #catalog)
 
     local filtered
     if self._filtered_screensavers_cache and self._filtered_screensavers_cache.key == ss_cache_key then
@@ -8129,6 +8457,7 @@ function Storefront:buildScreensaverEntries(available_list_height, available_lis
             raw_search = raw_search,
             raw_owner = raw_owner,
             ss_sort = ss_sort,
+            screensaver_collection = ss_col,
         })
         self._filtered_screensavers_cache = {
             key = ss_cache_key,
@@ -8494,6 +8823,9 @@ function Storefront:buildScreensaverEntries(available_list_height, available_lis
             end
             local ok_cov, res_cov = pcall(StorefrontScreensavers.createCoverImageWidget, path, inner_w, img_h)
             if ok_cov and res_cov then
+                if card._img_widget[1] and card._img_widget[1].free then
+                    pcall(card._img_widget[1].free, card._img_widget[1])
+                end
                 card._img_widget[1] = res_cov
                 if self_ref.browser_menu then
                     UIManager:setDirty(self_ref.browser_menu, "ui")
@@ -8551,6 +8883,12 @@ function Storefront:buildScreensaverEntries(available_list_height, available_lis
                     local thumb_path = current_worker.thumb_path
                     if (msg and msg:find("^OK")) or (thumb_path and ok_lfs and lfs and lfs.attributes and lfs.attributes(thumb_path, "mode") == "file") then
                         applyThumbnail(current_worker.card, thumb_path, current_worker.inner_w, current_worker.img_h)
+                        pcall(function()
+                            local ok_cl, StorefrontCacheLimit = pcall(require, "storefront_cache_limit")
+                            if ok_cl and StorefrontCacheLimit and StorefrontCacheLimit.enforce then
+                                StorefrontCacheLimit.enforce()
+                            end
+                        end)
                     else
                         if current_worker.entry then
                             current_worker.entry._thumb_failed = true
@@ -8987,21 +9325,7 @@ function Storefront:buildBrowserToolbar(current_tab)
             text = _("Check Updates"),
             text_font_bold = true,
             callback = function()
-                local installed_plugins = listInstalledPlugins()
-                local records = getInstallRecordsMap()
-                local plugin_repos = {}
-                for _, plugin in ipairs(installed_plugins) do
-                    local record = records[plugin.dirname]
-                    if record and record.owner and record.repo then
-                        record.dirname = plugin.dirname
-                        table.insert(plugin_repos, record)
-                    end
-                end
-                if #plugin_repos > 0 then
-                    self:_checkAllUpdatesInternal(plugin_repos)
-                else
-                    UIManager:show(InfoMessage:new{ text = _("No tracked plugins to check."), timeout = 4 })
-                end
+                self:checkAllUpdates()
             end,
         })
         table.insert(toolbar_buttons, {
@@ -9147,6 +9471,55 @@ function Storefront:buildBrowserToolbar(current_tab)
                     callback = function() self:showScreensaverFilter() end
                 })
             end
+
+            local ss_col_id = self.browser_state.screensaver_collection
+            if ss_col_id and ss_col_id ~= "" then
+                local StorefrontScreensavers = require("storefront_screensavers_ui")
+                local collections = StorefrontScreensavers.getCachedCollections() or {}
+                local col_title = _("Collection")
+                local col_obj = nil
+                for _, c in ipairs(collections) do
+                    if c.id == ss_col_id then
+                        col_title = c.title or col_title
+                        col_obj = c
+                        break
+                    end
+                end
+                table.insert(toolbar_buttons, {
+                    id = "ss_col_active",
+                    icon = "layers.svg",
+                    text = col_title .. " ✕",
+                    callback = function()
+                        self.browser_state.screensaver_collection = nil
+                        self.browser_state.page = 1
+                        if self.browser_menu and self.browser_menu.updateTabContent then
+                            self:updateBrowserTabInPlace("Screensavers", 1, nil, true)
+                        else
+                            self:reopenBrowser()
+                        end
+                    end
+                })
+                table.insert(toolbar_buttons, {
+                    id = "ss_col_download_all",
+                    icon = "download.svg",
+                    text = _("Download All"),
+                    callback = function()
+                        local StorefrontCollectionsDialog = require("storefront_collections_dialog")
+                        if col_obj and StorefrontCollectionsDialog.downloadAllInCollection then
+                            StorefrontCollectionsDialog.downloadAllInCollection(col_obj)
+                        end
+                    end
+                })
+            else
+                table.insert(toolbar_buttons, {
+                    id = "ss_collections",
+                    icon = "layers.svg",
+                    text = _("Collections"),
+                    callback = function()
+                        self:showCollectionsDialog()
+                    end
+                })
+            end
             local sort_labels = {
                 featured  = _("Featured"),
                 downloads = _("Most Downloaded"),
@@ -9181,7 +9554,8 @@ function Storefront:buildBrowserToolbar(current_tab)
             })
             table.insert(toolbar_buttons, {
                 id = "ss_settings",
-                text = _("⚙ Settings"),
+                icon = "settings.svg",
+                text = _("Settings"),
                 callback = function()
                     local StorefrontScreensaverConfig = require("storefront_screensaver_config")
                     StorefrontScreensaverConfig.show(self, function()
@@ -9554,6 +9928,13 @@ function Storefront:showBrowser(kind)
     end
     local current_tab = self.browser_state.tab or "Plugins"
     
+    -- Populate remote_info from catalog cache if available and not yet synced for current catalog timestamp
+    local cat_plugin_fetched = (Cache and Cache.getLastFetched and Cache.getLastFetched("plugin")) or 0
+    if cat_plugin_fetched > 0 and self._last_catalog_populated_ts ~= cat_plugin_fetched then
+        self._last_catalog_populated_ts = cat_plugin_fetched
+        pcall(function() self:populateRemoteInfoFromCatalog() end)
+    end
+
     -- Schedule deferred update checks ONCE per session on launch (zero launch delay)
     if not _session_bg_checks_done then
         _session_bg_checks_done = true
@@ -9829,6 +10210,10 @@ end
 
 function Storefront:showScreensaverFilter()
     require("storefront_filter_dialog").showScreensaverFilter(self)
+end
+
+function Storefront:showCollectionsDialog(callback)
+    require("storefront_collections_dialog").show(self, callback)
 end
 
 function Storefront:showInstalledFilter()
@@ -10665,6 +11050,8 @@ extractPluginToUserDir = function(reader, info, dest_root)
 
     -- Remove only the files that the archive will replace so stale code
     -- from a previous version does not linger.
+    -- Native libraries are NOT unlinked while KOReader is running; they are staged as .new.
+    local ok_inst, StorefrontInstaller = pcall(require, "storefront_installer")
     if lfs.attributes(target_dir, "mode") == "directory" then
         local function remove_archive_files(dir, prefix)
             for f in lfs.dir(dir) do
@@ -10672,9 +11059,10 @@ extractPluginToUserDir = function(reader, info, dest_root)
                     local rel = (prefix == "") and f or (prefix .. "/" .. f)
                     local full = dir .. "/" .. f
                     local mode = lfs.attributes(full, "mode")
+                    local is_native = ok_inst and StorefrontInstaller and StorefrontInstaller.isNativeLibraryPath and StorefrontInstaller.isNativeLibraryPath(rel)
                     if mode == "directory" then
                         remove_archive_files(full, rel)
-                    elseif mode == "file" and archive_relatives[rel] and not protected_configs[rel] then
+                    elseif mode == "file" and archive_relatives[rel] and not protected_configs[rel] and not is_native then
                         os.remove(full)
                     end
                 end
@@ -10700,9 +11088,30 @@ extractPluginToUserDir = function(reader, info, dest_root)
                     if parent and parent ~= "" then
                         util.makePath(parent)
                     end
-                    local ok = reader:extractToPath(entry.path, dest_path)
+
+                    local dst_to_extract = dest_path
+                    local is_native = ok_inst and StorefrontInstaller and StorefrontInstaller.isNativeLibraryPath and StorefrontInstaller.isNativeLibraryPath(relative)
+                    local target_exists = (lfs.attributes(dest_path, "mode") == "file")
+
+                    if is_native and target_exists then
+                        dst_to_extract = dest_path .. ".new"
+                        os.remove(dst_to_extract)
+                    end
+
+                    local ok = reader:extractToPath(entry.path, dst_to_extract)
                     if not ok then
                         return false, _("Failed to extract file: ") .. entry.path
+                    end
+
+                    if is_native and target_exists then
+                        if ok_inst and StorefrontInstaller and StorefrontInstaller.stageNativeLibrary then
+                            StorefrontInstaller.stageNativeLibrary(dst_to_extract, dest_path)
+                        end
+                        if ok_inst and StorefrontInstaller and StorefrontInstaller.installSafeExitHook then
+                            StorefrontInstaller.installSafeExitHook()
+                        end
+                    else
+                        os.remove(dest_path .. ".new")
                     end
                 end
             end
@@ -10788,12 +11197,16 @@ function Storefront:handlePostInstall(info, repo)
 
     if info and info.plugin_dirname and info.source == "branch" then
         self:ensureUpdatesState()
-        self.updates_state.remote_info[info.plugin_dirname] = {
-            remote_version = info.sha,
-            release_tag_name = (info.branch or "branch") .. "@" .. (info.sha and info.sha:sub(1, 7) or ""),
-            last_checked = os.time(),
-            error = nil,
-        }
+        if info.sha and info.sha ~= "" then
+            self.updates_state.remote_info[info.plugin_dirname] = {
+                remote_version = info.sha,
+                release_tag_name = (info.branch or "branch") .. "@" .. info.sha:sub(1, 7),
+                last_checked = os.time(),
+                error = nil,
+            }
+        else
+            self.updates_state.remote_info[info.plugin_dirname] = nil
+        end
         self:saveUpdatesState()
     end
 
@@ -10906,18 +11319,27 @@ end
 
 function Storefront:onReaderReady(ui)
     self.ui = ui
-    if self.ui and self.ui.registerModule then
+    if self.ui and self.ui.registerModule and not self.ui._sf_module_registered then
+        self.ui._sf_module_registered = true
         pcall(self.ui.registerModule, self.ui, "storefront", self, true)
     end
 end
 
 function Storefront:init()
-    Localization:init(self.path)
-    StorefrontLogger.reset()
+    Localization:ensureInit(self.path)
+    if not _G.G_session_init_done then
+        StorefrontLogger.reset()
+    end
     local mode_str = GitHub.isDirectApiEnabled() and "Direct API" or "Storefront Catalog"
-    local plugin_count = Cache.countRepos and Cache.countRepos("plugin") or #Cache.listRepos("plugin")
-    local patch_count = Cache.countRepos and Cache.countRepos("patch") or 0
-    local font_count = Cache.countRepos and Cache.countRepos("font") or 0
+    local plugin_count = (Cache.getCachedCount and Cache.getCachedCount("plugin"))
+        or (Cache.countRepos and Cache.countRepos("plugin"))
+        or 0
+    local patch_count = (Cache.getCachedCount and Cache.getCachedCount("patch"))
+        or (Cache.countRepos and Cache.countRepos("patch"))
+        or 0
+    local font_count = (Cache.getCachedCount and Cache.getCachedCount("font"))
+        or (Cache.countRepos and Cache.countRepos("font"))
+        or 0
     local screensaver_count = 0
     pcall(function()
         local ok_ss, StorefrontScreensavers = pcall(require, "storefront_screensavers_ui")
@@ -10925,19 +11347,37 @@ function Storefront:init()
             screensaver_count = StorefrontScreensavers.getCachedCount()
         end
     end)
-    StorefrontLogger.info(string.format("Storefront initialized (Mode: %s, Cached: %d plugins, %d patches, %d fonts, %d screensavers)", mode_str, plugin_count or 0, patch_count or 0, font_count or 0, screensaver_count or 0))
+    if not _G.G_session_init_done then
+        StorefrontLogger.info(string.format("Storefront initialized (Mode: %s, Cached: %d plugins, %d patches, %d fonts, %d screensavers)", mode_str, plugin_count or 0, patch_count or 0, font_count or 0, screensaver_count or 0))
+    else
+        logger.dbg(string.format("Storefront initialized widget (Mode: %s, Cached: %d plugins, %d patches, %d fonts, %d screensavers)", mode_str, plugin_count or 0, patch_count or 0, font_count or 0, screensaver_count or 0))
+    end
     Storefront.instance = self
     self.cache_dir = ensureCacheDir()
     self:onDispatcherRegisterActions()
-    self.ui.menu:registerToMainMenu(self)
-    if self.ui and self.ui.registerModule then
+    if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
+        self.ui.menu:registerToMainMenu(self)
+    end
+    if self.ui and self.ui.registerModule and not self.ui._sf_module_registered then
+        self.ui._sf_module_registered = true
         pcall(self.ui.registerModule, self.ui, "storefront", self, true)
     end
     pcall(function()
         local UIManager = require("ui/uimanager")
-        if UIManager and UIManager.event_hook and UIManager.event_hook.registerWidget then
-            UIManager.event_hook:registerWidget("Suspend", self)
-            UIManager.event_hook:registerWidget("Resume", self)
+        if UIManager and UIManager.event_hook and UIManager.event_hook.registerWidget and not UIManager._sf_event_hooked then
+            UIManager._sf_event_hooked = true
+            local hook_proxy = {
+                onSuspend = function()
+                    local target = Storefront.instance or Storefront
+                    if target and target.onSuspend then target:onSuspend() end
+                end,
+                onResume = function()
+                    local target = Storefront.instance or Storefront
+                    if target and target.onResume then target:onResume() end
+                end,
+            }
+            UIManager.event_hook:registerWidget("Suspend", hook_proxy)
+            UIManager.event_hook:registerWidget("Resume", hook_proxy)
         end
     end)
     -- Hook directly into Device power lifecycle so onSuspend/onResume always run regardless of active UI
@@ -11093,6 +11533,19 @@ function Storefront:init()
         end
     end
 
+    -- Non-blocking deferred cache limit enforcement on startup (deferred by 5s)
+    pcall(function()
+        local UIManager = require("ui/uimanager")
+        if UIManager and UIManager.scheduleIn then
+            UIManager:scheduleIn(5, function()
+                local ok_cl, StorefrontCacheLimit = pcall(require, "storefront_cache_limit")
+                if ok_cl and StorefrontCacheLimit and StorefrontCacheLimit.enforce then
+                    StorefrontCacheLimit.enforce()
+                end
+            end)
+        end
+    end)
+
     -- Trigger non-blocking silent catalog update on startup (deferred by 60s so it doesn't collide with KOReader startup)
     -- NOTE: We intentionally do NOT use NetworkMgr:runWhenOnline here because that prompts the user
     -- to enable wifi when offline. This is a background operation; silently skip if not connected.
@@ -11171,8 +11624,11 @@ function Storefront:init()
                 if ok then
                     logger.info("Storefront init: background catalog update finished (" .. tostring(status_or_err) .. ")")
                     StorefrontLogger.info("Storefront init: background catalog update finished (" .. tostring(status_or_err) .. ")")
-                    if status_or_err == "updated" and Storefront.instance and Storefront.instance.browser_menu then
-                        Storefront.instance:refreshCurrentBrowserTab()
+                    if status_or_err == "updated" and Storefront.instance then
+                        pcall(function() Storefront.instance:populateRemoteInfoFromCatalog() end)
+                        if Storefront.instance.browser_menu then
+                            Storefront.instance:refreshCurrentBrowserTab()
+                        end
                     end
                     pcall(function()
                         if Storefront.checkStartupNotifications then
@@ -11203,8 +11659,11 @@ function Storefront:init()
                                 if retry_ok then
                                     logger.info("Storefront init: background catalog update retry succeeded (" .. tostring(retry_status_or_err) .. ")")
                                     if StorefrontLogger then StorefrontLogger.info("Storefront init: background catalog update retry succeeded (" .. tostring(retry_status_or_err) .. ")") end
-                                    if retry_status_or_err == "updated" and Storefront.instance and Storefront.instance.browser_menu then
-                                        Storefront.instance:refreshCurrentBrowserTab()
+                                    if retry_status_or_err == "updated" and Storefront.instance then
+                                        pcall(function() Storefront.instance:populateRemoteInfoFromCatalog() end)
+                                        if Storefront.instance.browser_menu then
+                                            Storefront.instance:refreshCurrentBrowserTab()
+                                        end
                                     end
                                     pcall(function()
                                         if Storefront.checkStartupNotifications then
@@ -11235,8 +11694,14 @@ function Storefront:init()
             end)
         end
     end
-    Storefront._bg_catalog_init_timer_fn = _bg_catalog_init_fn
-    UIManager:scheduleIn(60, _bg_catalog_init_fn)
+    if not _session_bg_catalog_timer_done then
+        _session_bg_catalog_timer_done = true
+        if Storefront._bg_catalog_init_timer_fn and UIManager and UIManager.unschedule then
+            UIManager:unschedule(Storefront._bg_catalog_init_timer_fn)
+        end
+        Storefront._bg_catalog_init_timer_fn = _bg_catalog_init_fn
+        UIManager:scheduleIn(60, _bg_catalog_init_fn)
+    end
 
     pcall(function() self:scheduleNotificationTimer() end)
 end
@@ -11328,15 +11793,12 @@ function Storefront:onNetworkConnected()
     end
 end
 
-function Storefront:onSuspend()
-    logger.info("Storefront: onSuspend received — aborting active tasks and purging memory")
-    if StorefrontLogger then StorefrontLogger.info("Storefront: onSuspend received — aborting active tasks and purging memory") end
-
-    -- 1. Cancel in-flight screensaver thumbnail queue & terminate active worker
-    self._ss_thumb_task_id = (self._ss_thumb_task_id or 0) + 1
-    if self._active_thumb_worker then
-        local w = self._active_thumb_worker
-        self._active_thumb_worker = nil
+local function cleanupInstanceSuspendState(inst)
+    if type(inst) ~= "table" then return end
+    inst._ss_thumb_task_id = (inst._ss_thumb_task_id or 0) + 1
+    if inst._active_thumb_worker then
+        local w = inst._active_thumb_worker
+        inst._active_thumb_worker = nil
         pcall(function()
             local ok_ffi, ffiutil = pcall(require, "ffi/util")
             if not ok_ffi then ok_ffi, ffiutil = pcall(require, "ffiutil") end
@@ -11353,6 +11815,73 @@ function Storefront:onSuspend()
                 end
             end
         end)
+    end
+    inst.screensavers_cache = nil
+    inst._filtered_screensavers_cache = nil
+    inst._screensavers_all_cache = nil
+end
+
+local function setModuleSuspendedState(self_inst, state)
+    Storefront._is_suspended = state
+    if type(self_inst) == "table" and self_inst ~= Storefront then
+        rawset(self_inst, "_is_suspended", state)
+    end
+    if type(Storefront.instance) == "table" and Storefront.instance ~= Storefront then
+        rawset(Storefront.instance, "_is_suspended", state)
+    end
+end
+
+function Storefront:onSuspend(is_widget_close)
+    local UIManager = require("ui/uimanager")
+    if is_widget_close then
+        -- Widget close transition (e.g., closing FileManager to open a book, or closing ReaderUI).
+        -- Clean up instance-specific UI state and workers, but preserve module-level caches
+        -- (Cache and StorefrontScreensavers) and skip GC sweeps so book opens are instantaneous.
+        cleanupInstanceSuspendState(self)
+        if UIManager and UIManager.unschedule then
+            if _catalog_show_timer_fn then
+                UIManager:unschedule(_catalog_show_timer_fn)
+                _catalog_show_timer_fn = nil
+            end
+            if _screensaver_warmup_timer_fn then
+                UIManager:unschedule(_screensaver_warmup_timer_fn)
+                _screensaver_warmup_timer_fn = nil
+            end
+        else
+            _catalog_show_timer_fn = nil
+            _screensaver_warmup_timer_fn = nil
+        end
+        return
+    end
+
+    if Storefront._is_suspended or rawget(self, "_is_suspended") then
+        -- Fast-path deduplication: already suspended in this sleep cycle.
+        -- Ensure any tasks are cancelled idempotently, but skip duplicate logging and double-GC.
+        cleanupInstanceSuspendState(self)
+        if Storefront.instance and Storefront.instance ~= self then
+            cleanupInstanceSuspendState(Storefront.instance)
+        end
+        pcall(function()
+            local ok_cat, CatalogClient = pcall(require, "storefront_net_catalog")
+            if ok_cat and CatalogClient and CatalogClient.cancelCatalogFetch then
+                CatalogClient.cancelCatalogFetch()
+            end
+        end)
+        return
+    end
+
+    setModuleSuspendedState(self, true)
+
+    logger.info("Storefront: onSuspend received — aborting active tasks and purging memory")
+    if StorefrontLogger then StorefrontLogger.info("Storefront: onSuspend received — aborting active tasks and purging memory") end
+
+    -- 1. Cancel in-flight screensaver thumbnail queue & terminate active worker
+    cleanupInstanceSuspendState(self)
+    if Storefront.instance and Storefront.instance ~= self then
+        cleanupInstanceSuspendState(Storefront.instance)
+    end
+    if Storefront ~= self and Storefront ~= Storefront.instance then
+        cleanupInstanceSuspendState(Storefront)
     end
     pcall(function()
         local ok_ss, StorefrontScreensavers = pcall(require, "storefront_screensavers_ui")
@@ -11382,30 +11911,36 @@ function Storefront:onSuspend()
     end)
 
     -- 4. Unschedule pending timers
-    if Storefront._bg_catalog_init_timer_fn then
-        UIManager:unschedule(Storefront._bg_catalog_init_timer_fn)
+    if UIManager and UIManager.unschedule then
+        if Storefront._bg_catalog_init_timer_fn then
+            UIManager:unschedule(Storefront._bg_catalog_init_timer_fn)
+            Storefront._bg_catalog_init_timer_fn = nil
+        end
+        if _catalog_retry_timer_fn then
+            UIManager:unschedule(_catalog_retry_timer_fn)
+            _catalog_retry_timer_fn = nil
+        end
+        if _catalog_show_timer_fn then
+            UIManager:unschedule(_catalog_show_timer_fn)
+            _catalog_show_timer_fn = nil
+        end
+        if _screensaver_warmup_timer_fn then
+            UIManager:unschedule(_screensaver_warmup_timer_fn)
+            _screensaver_warmup_timer_fn = nil
+        end
+        if _notification_timer_fn then
+            UIManager:unschedule(_notification_timer_fn)
+            _notification_timer_fn = nil
+        end
+    else
         Storefront._bg_catalog_init_timer_fn = nil
-    end
-    if _catalog_retry_timer_fn then
-        UIManager:unschedule(_catalog_retry_timer_fn)
         _catalog_retry_timer_fn = nil
-    end
-    if _catalog_show_timer_fn then
-        UIManager:unschedule(_catalog_show_timer_fn)
         _catalog_show_timer_fn = nil
-    end
-    if _screensaver_warmup_timer_fn then
-        UIManager:unschedule(_screensaver_warmup_timer_fn)
         _screensaver_warmup_timer_fn = nil
-    end
-    if _notification_timer_fn then
-        UIManager:unschedule(_notification_timer_fn)
         _notification_timer_fn = nil
     end
 
     -- 5. Free large in-memory caches to prevent Kindle OOM killer
-    self.screensavers_cache = nil
-    self._screensavers_all_cache = nil
     pcall(function()
         local ok_ss, StorefrontScreensavers = pcall(require, "storefront_screensavers_ui")
         if ok_ss and StorefrontScreensavers and StorefrontScreensavers.invalidateMemCache then
@@ -11419,12 +11954,15 @@ function Storefront:onSuspend()
         end
     end)
 
-    -- 6. Trigger Lua garbage collector immediately before device goes to sleep
-    collectgarbage("collect")
-    collectgarbage("collect")
+    -- 6. Perform a single incremental GC step instead of blocking sleep with a full heap sweep
+    collectgarbage("step", 200)
 end
 
 function Storefront:onResume()
+    if Storefront._is_suspended == false or rawget(self, "_is_suspended") == false then
+        return
+    end
+    setModuleSuspendedState(self, false)
     logger.info("Storefront: onResume received")
     if StorefrontLogger then StorefrontLogger.info("Storefront: onResume received") end
     pcall(function()
@@ -11435,7 +11973,14 @@ function Storefront:onResume()
 end
 
 function Storefront:onCloseWidget()
-    self:onSuspend()
+    if self._is_widget_closed then
+        return
+    end
+    self._is_widget_closed = true
+    if self.browser_menu then
+        self:closeBrowserMenu()
+    end
+    self:onSuspend(true)
 end
 
 

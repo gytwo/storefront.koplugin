@@ -40,6 +40,10 @@ local socketutil = require("socketutil")
 local util = require("util")
 local startDownloadProgress = require("storefront_download_progress").start
 
+local ok_rapid, rapidjson = pcall(require, "rapidjson")
+local ok_json, json_mod = pcall(require, "json")
+local json = (ok_rapid and rapidjson) or (ok_json and json_mod) or nil
+
 local M = {}
 
 local function ensureCacheDir()
@@ -49,6 +53,274 @@ local function ensureCacheDir()
     local util = require("util")
     util.makePath(base)
     return base
+end
+
+-- Extracts a 40-character commit SHA from the zip End-of-Central-Directory (EOCD)
+-- comment embedded by GitHub's codeload archive service.
+-- Returns 40-char SHA string or nil.
+local function extractGitHubZipCommitSha(zip_path)
+    if not zip_path then return nil end
+    local f = io.open(zip_path, "rb")
+    if not f then return nil end
+    local size = f:seek("end")
+    if not size or size < 22 then
+        f:close()
+        return nil
+    end
+    -- Standard EOCD is at least 22 bytes; with 40-byte comment it is 62 bytes. Read up to 256 bytes from end.
+    local read_len = math.min(size, 256)
+    f:seek("set", size - read_len)
+    local tail = f:read(read_len)
+    f:close()
+    if not tail then return nil end
+
+    -- Locate EOCD signature: "PK\x05\x06"
+    local eocd_pos = tail:find("PK\005\006", 1, true)
+    while eocd_pos do
+        if #tail >= eocd_pos + 21 then
+            local comment_len = tail:byte(eocd_pos + 20) + (tail:byte(eocd_pos + 21) * 256)
+            local comment_start = eocd_pos + 22
+            local comment_end = comment_start + comment_len - 1
+            if comment_len >= 40 and #tail >= comment_end then
+                local comment = tail:sub(comment_start, comment_end)
+                local sha = comment:match("(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)")
+                if sha then
+                    return sha:lower()
+                end
+            end
+        end
+        eocd_pos = tail:find("PK\005\006", eocd_pos + 1, true)
+    end
+    return nil
+end
+
+local _staged_native_libs = {}
+local _native_libs_unlinked = false
+local _exit_hook_installed = false
+local _main_pid = nil
+
+local function isNativeLibraryPath(path)
+    if not path or type(path) ~= "string" then return false end
+    local filename = path:match("([^/\\]+)$") or path
+    filename = filename:lower()
+    return (filename:match("%.so$") ~= nil) or (filename:match("%.so%.[%d%.]+$") ~= nil)
+end
+
+local function getStagedNativeLibsPath()
+    local cache_dir = ensureCacheDir()
+    return cache_dir .. "/staged_native_libs.json"
+end
+
+local function saveStagedNativeLibsQueue(queue)
+    local path = getStagedNativeLibsPath()
+    if not queue or #queue == 0 then
+        os.remove(path)
+        return
+    end
+    local serialized = nil
+    if json and json.encode then
+        pcall(function() serialized = json.encode(queue) end)
+    end
+    if serialized then
+        local f = io.open(path, "w")
+        if f then
+            f:write(serialized)
+            f:close()
+        end
+    end
+end
+
+local function loadStagedNativeLibsQueue()
+    local path = getStagedNativeLibsPath()
+    local f = io.open(path, "r")
+    if not f then return {} end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return {} end
+    local data = nil
+    if json and json.decode then
+        pcall(function() data = json.decode(content) end)
+    end
+    if type(data) == "table" then
+        return data
+    end
+    return {}
+end
+
+local function stageNativeLibrary(staged_path, target_path)
+    if not staged_path or not target_path then return end
+    for _, item in ipairs(_staged_native_libs) do
+        if item.target == target_path then
+            item.staged = staged_path
+            saveStagedNativeLibsQueue(_staged_native_libs)
+            return
+        end
+    end
+    table.insert(_staged_native_libs, {
+        staged = staged_path,
+        target = target_path,
+    })
+    saveStagedNativeLibsQueue(_staged_native_libs)
+end
+
+local function markNativeLibraryUnlinked(path)
+    _native_libs_unlinked = true
+end
+
+local function hasPendingNativeLibExitHazard()
+    return (_staged_native_libs and #_staged_native_libs > 0) or (_native_libs_unlinked == true)
+end
+
+local function getStagedNativeLibs()
+    return _staged_native_libs
+end
+
+local function clearStagedNativeLibs()
+    _staged_native_libs = {}
+    _native_libs_unlinked = false
+    os.remove(getStagedNativeLibsPath())
+end
+
+local function swapFile(staged, target)
+    if not staged or not target then return false end
+    if lfs.attributes(staged, "mode") ~= "file" then return false end
+
+    os.remove(target)
+    local ok, err = os.rename(staged, target)
+    if ok then
+        return true
+    end
+
+    local f_in = io.open(staged, "rb")
+    if not f_in then return false, err end
+    local f_out = io.open(target, "wb")
+    if not f_out then
+        f_in:close()
+        return false, "failed to open target for write"
+    end
+    local chunk_size = 65536
+    while true do
+        local chunk = f_in:read(chunk_size)
+        if not chunk then break end
+        f_out:write(chunk)
+    end
+    f_in:close()
+    f_out:close()
+    os.remove(staged)
+    return true
+end
+
+local function applyStagedNativeLibs()
+    if not _staged_native_libs or #_staged_native_libs == 0 then
+        local disk_queue = loadStagedNativeLibsQueue()
+        if disk_queue and #disk_queue > 0 then
+            _staged_native_libs = disk_queue
+        end
+    end
+
+    if _staged_native_libs and #_staged_native_libs > 0 then
+        for _, item in ipairs(_staged_native_libs) do
+            if item.staged and item.target then
+                if lfs.attributes(item.staged, "mode") == "file" then
+                    swapFile(item.staged, item.target)
+                end
+            end
+        end
+    end
+    clearStagedNativeLibs()
+end
+
+local function getCurrentPid()
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if ok_ffi and ffi and ffi.C then
+        local ok_pid, pid = pcall(function() return ffi.C.getpid() end)
+        if ok_pid and pid then
+            return tonumber(pid)
+        end
+    end
+    return nil
+end
+
+local function declarePosixExit()
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if ok_ffi and ffi then
+        pcall(function()
+            ffi.cdef[[
+                int getpid(void);
+                void _exit(int status);
+            ]]
+        end)
+    end
+end
+
+local function installSafeExitHook()
+    if _exit_hook_installed then return end
+    declarePosixExit()
+    _main_pid = getCurrentPid()
+    local orig_os_exit = _G.os.exit
+
+    _G.os.exit = function(code, close_state)
+        local cur_pid = getCurrentPid()
+        local is_main_proc = (not _main_pid) or (not cur_pid) or (cur_pid == _main_pid)
+
+        if is_main_proc and hasPendingNativeLibExitHazard() then
+            pcall(collectgarbage, "stop")
+            applyStagedNativeLibs()
+            pcall(function()
+                if io.stdout then io.stdout:flush() end
+                if io.stderr then io.stderr:flush() end
+            end)
+
+            local status = 0
+            if type(code) == "number" then
+                status = code
+            elseif code == false then
+                status = 1
+            elseif code == true then
+                status = 0
+            end
+
+            local ok_ffi, ffi = pcall(require, "ffi")
+            if ok_ffi and ffi and ffi.C and ffi.C._exit and not _G._STOREFRONT_TEST_NO_POSIX_EXIT then
+                ffi.C._exit(status)
+                return
+            end
+
+            if type(orig_os_exit) == "function" then
+                return orig_os_exit(status, false)
+            end
+            return
+        end
+
+        if type(orig_os_exit) == "function" then
+            return orig_os_exit(code, close_state)
+        end
+    end
+    _exit_hook_installed = true
+end
+
+local function recoverStagedNativeLibsOnStartup()
+    local disk_queue = loadStagedNativeLibsQueue()
+    if not disk_queue or #disk_queue == 0 then return end
+
+    local remaining = {}
+    for _, item in ipairs(disk_queue) do
+        local staged_mode = item.staged and lfs.attributes(item.staged, "mode")
+        local target_mode = item.target and lfs.attributes(item.target, "mode")
+        if staged_mode == "file" then
+            if target_mode ~= "file" then
+                swapFile(item.staged, item.target)
+            else
+                table.insert(remaining, item)
+            end
+        end
+    end
+
+    _staged_native_libs = remaining
+    saveStagedNativeLibsQueue(remaining)
+    if #remaining > 0 then
+        installSafeExitHook()
+    end
 end
 
 local function normalizeAssetVariantKey(filename)
@@ -179,18 +451,84 @@ local function extractReleaseNameFallback(repo)
     return "plugin"
 end
 
+local function appendExtraPluginsWarning(msg, info)
+    if not info or type(info.extra_plugins) ~= "table" or #info.extra_plugins == 0 then
+        return msg
+    end
+    local skipped_str = table.concat(info.extra_plugins, ", ")
+    StorefrontLogger.warn(string.format("Archive contained extra plugin folder(s) that were skipped: %s", skipped_str))
+    local warning_text = string.format(_("Note: Archive contained extra plugin folder(s) that were skipped: %s"), skipped_str)
+    if type(msg) == "string" and msg ~= "" then
+        return msg .. "\n\n" .. warning_text
+    end
+    return warning_text
+end
+
 local function detectPluginFromArchive(reader, repo)
     if not reader then return nil, _("Invalid archive reader") end
     local meta_entry = nil
+    local meta_depth = nil
+    local meta_is_plugin = false
+    local meta_matches_repo = false
+    local meta_is_core = false
     local root_dirs = {}
+    local encountered_koplugins = {}
+
+    local core_plugins = nil
+    local ok_m, sm = pcall(require, "storefront_match")
+    if ok_m and sm and type(sm.CORE_KOREADER_PLUGINS) == "table" then
+        core_plugins = sm.CORE_KOREADER_PLUGINS
+    else
+        core_plugins = {}
+    end
+
+    local repo_base_lower = nil
+    if repo and repo.name and repo.name ~= "" then
+        repo_base_lower = repo.name:gsub("%.koplugin$", ""):lower()
+    end
 
     for entry in reader:iterate() do
         local path = entry.path
         if path then
             local root = path:match("^([^/]+)/")
             if root then root_dirs[root] = true end
-            if path:match("_meta%.lua$") then
-                meta_entry = entry
+
+            local kop_prefix, kop_name = path:match("^(.-/?([^/]+%.koplugin))/")
+            if kop_prefix and kop_name then
+                encountered_koplugins[kop_prefix] = kop_name
+            end
+
+            if entry.mode == "file" and (path == "_meta.lua" or path:match("/_meta%.lua$")) then
+                local _, depth = path:gsub("/", "")
+                local is_plugin = path:match("%.koplugin/_meta%.lua$") ~= nil
+                local enclosing_dir = path:match("([^/]+)/_meta%.lua$") or ""
+                local enclosing_base = enclosing_dir:gsub("%.koplugin$", ""):lower()
+                local matches_repo = (repo_base_lower ~= nil and enclosing_base == repo_base_lower)
+                local is_core = (core_plugins[enclosing_base .. ".koplugin"] == true) or (core_plugins[enclosing_base] == true)
+
+                local preferred_tie = false
+                if depth == meta_depth then
+                    if is_plugin ~= meta_is_plugin then
+                        preferred_tie = is_plugin
+                    elseif matches_repo ~= meta_matches_repo then
+                        preferred_tie = matches_repo
+                    elseif is_core ~= meta_is_core then
+                        preferred_tie = not is_core
+                    else
+                        preferred_tie = (path < meta_entry.path)
+                    end
+                end
+
+                -- Embedded components can have metadata too. The outer plugin
+                -- owns the install directory and must include those components.
+                -- At equal depth prefer .koplugin, repo match, non-core, then lexical.
+                if not meta_depth or depth < meta_depth or preferred_tie then
+                    meta_entry = entry
+                    meta_depth = depth
+                    meta_is_plugin = is_plugin
+                    meta_matches_repo = matches_repo
+                    meta_is_core = is_core
+                end
             end
         end
     end
@@ -248,10 +586,35 @@ local function detectPluginFromArchive(reader, repo)
         end
     end
 
+    local extra_map = {}
+    local norm_chosen = plugin_dirname and plugin_dirname:lower()
+    for kop_path, kop_name in pairs(encountered_koplugins) do
+        local is_inside_prefix = false
+        if prefix and prefix ~= "" then
+            if kop_path:sub(1, #prefix) == prefix then
+                is_inside_prefix = true
+            end
+        end
+        if not is_inside_prefix and kop_name:lower() ~= norm_chosen then
+            extra_map[kop_name] = true
+        end
+    end
+
+    local extra_plugins = nil
+    local extra_list = {}
+    for name in pairs(extra_map) do
+        table.insert(extra_list, name)
+    end
+    if #extra_list > 0 then
+        table.sort(extra_list)
+        extra_plugins = extra_list
+    end
+
     return {
         plugin_dirname = plugin_dirname,
         prefix = prefix,
         meta_entry = meta_entry,
+        extra_plugins = extra_plugins,
     }
 end
 
@@ -266,6 +629,11 @@ local function extractPluginToUserDir(reader, info, dest_root)
     local prefix = info.prefix or ""
     local extracted_any = false
 
+    local protected_configs = {
+        ["storefront_config.lua"] = true,
+        ["storefront_configuration.lua"] = true,
+    }
+
     for entry in reader:iterate() do
         local path = entry.path
         if path and path:sub(1, #prefix) == prefix then
@@ -275,10 +643,30 @@ local function extractPluginToUserDir(reader, info, dest_root)
                 if entry.mode == "directory" then
                     util.makePath(full_dst)
                 elseif entry.mode == "file" then
-                    local parent = full_dst:match("^(.*)/")
-                    if parent then util.makePath(parent) end
-                    reader:extractToPath(entry.path, full_dst)
-                    extracted_any = true
+                    local is_protected = protected_configs[rel_path] and (lfs.attributes(full_dst, "mode") == "file")
+                    if not is_protected then
+                        local parent = full_dst:match("^(.*)/")
+                        if parent then util.makePath(parent) end
+
+                        local dst_to_extract = full_dst
+                        local is_native = isNativeLibraryPath(rel_path)
+                        local target_exists = (lfs.attributes(full_dst, "mode") == "file")
+
+                        if is_native and target_exists then
+                            dst_to_extract = full_dst .. ".new"
+                            os.remove(dst_to_extract)
+                        end
+
+                        reader:extractToPath(entry.path, dst_to_extract)
+                        extracted_any = true
+
+                        if is_native and target_exists then
+                            stageNativeLibrary(dst_to_extract, full_dst)
+                            installSafeExitHook()
+                        else
+                            os.remove(full_dst .. ".new")
+                        end
+                    end
                 end
             end
         end
@@ -292,6 +680,8 @@ local function extractPluginToUserDir(reader, info, dest_root)
 end
 
 function M:init(Storefront)
+    recoverStagedNativeLibsOnStartup()
+    installSafeExitHook()
     function Storefront:resolveNewInstallDestination(callback, on_cancel)
         local REMEMBERED_PLUGIN_INSTALL_PATH_KEY = "remembered_plugin_install_path"
         local ok_cfg, StorefrontConfig = pcall(require, "storefront_config")
@@ -1385,7 +1775,9 @@ function M:init(Storefront)
             end
         end
 
+        local is_default_branch_fallback = false
         if not url or url == "" then
+            is_default_branch_fallback = true
             if GitHub.isDirectApiEnabled() then
                 url = string.format("https://api.github.com/repos/%s/%s/zipball", owner, repo.name)
             else
@@ -1513,9 +1905,19 @@ function M:init(Storefront)
                 end
 
                 local is_batch = (_G.G_storefront_batch_updating == true) or (self.pending_install_context and self.pending_install_context.is_batch == true)
+                msg = appendExtraPluginsWarning(msg, info)
+                msg = appendExtraPluginsWarning(msg, info)
                 StorefrontLogger.action(msg)
                 if not is_batch and not _G.G_storefront_batch_updating then
                     self:showRestartConfirmation(msg)
+                end
+
+                if is_default_branch_fallback then
+                    info.source = "branch"
+                    info.branch = branch
+                    if head_sha then
+                        info.sha = head_sha
+                    end
                 end
 
                 self:handlePostInstall(info, repo)
@@ -1550,7 +1952,7 @@ function M:init(Storefront)
             trap_widget = batch_toast
         else
             local Toast = require("storefront_toast")
-            trap_widget = Toast.show(dl_msg, 0)
+            trap_widget = Toast.show(dl_msg, 0, { show_cancel = true })
         end
 
         local Trapper = require("ui/trapper")
@@ -1558,7 +1960,11 @@ function M:init(Storefront)
             local stop_progress = startDownloadProgress(trap_widget, dl_msg, zip_path, nil)
             local completed, res = Trapper:dismissableRunInSubprocess(function()
                 local dl_ok, dl_err = downloadToFile(url, zip_path)
-                return { ok = dl_ok, err = dl_err }
+                local head_sha
+                if dl_ok and is_default_branch_fallback then
+                    head_sha = extractGitHubZipCommitSha(zip_path) or GitHub.fetchBranchSHA(owner, repo.name, branch)
+                end
+                return { ok = dl_ok, err = dl_err, head_sha = head_sha }
             end, trap_widget)
             stop_progress()
 
@@ -1578,7 +1984,7 @@ function M:init(Storefront)
                 end
                 return
             end
-            doInstall(res and res.ok, res and res.err)
+            doInstall(res and res.ok, res and res.err, res and res.head_sha)
         end)
     end
 
@@ -1725,6 +2131,7 @@ function M:init(Storefront)
                     end
                 end
 
+                msg = appendExtraPluginsWarning(msg, info)
                 StorefrontLogger.action(msg)
                 if not is_batch and not _G.G_storefront_batch_updating then
                     self:showRestartConfirmation(msg)
@@ -1809,16 +2216,6 @@ function M:init(Storefront)
         StorefrontLogger.action(string.format("INSTALL from branch starting: %s/%s@%s", owner, repo_name, branch_name))
 
         NetworkMgr:runWhenOnline(function()
-            local fetch_toast
-            if not is_batch then
-                local Toast = require("storefront_toast")
-                fetch_toast = Toast.show(_("Fetching branch information…"), 0)
-                if UIManager.forceRePaint then UIManager:forceRePaint() end
-            end
-
-            local head_sha = GitHub.fetchBranchSHA(owner, repo_name, branch_name)
-            if fetch_toast and fetch_toast.close then fetch_toast:close() end
-
             local url
             if GitHub.isDirectApiEnabled() then
                 url = string.format("https://api.github.com/repos/%s/%s/zipball/%s", owner, repo_name, branch_name)
@@ -1834,7 +2231,7 @@ function M:init(Storefront)
             local zip_path = string.format("%s/%s-%s-%d.zip", downloads_dir, repo_name, branch_name, os.time())
             local plugin_display_name = repo.name or repo.full_name or "plugin"
 
-            local function doInstall(ok, err)
+            local function doInstall(ok, err, head_sha)
                 if not ok then
                     util.removeFile(zip_path)
                     if not is_batch then
@@ -1884,6 +2281,10 @@ function M:init(Storefront)
                         cb(false, detect_err or "Could not detect plugin inside archive")
                     end
                     return
+                end
+
+                if not head_sha or head_sha == "" then
+                    StorefrontLogger.warn(string.format("Could not resolve commit SHA for %s/%s@%s", owner, repo_name, branch_name))
                 end
 
                 info.source = "branch"
@@ -1966,7 +2367,7 @@ function M:init(Storefront)
                     end
                 end
 
-                if self.pending_install_context and self.pending_install_context.mode == "update" then
+                if self.pending_install_context and self.pending_install_context.mode == "update" and self.pending_install_context.plugin and self.pending_install_context.plugin.root then
                     proceedWithInstall(self.pending_install_context.plugin.root)
                 else
                     self:resolveNewInstallDestination(proceedWithInstall, function()
@@ -2000,7 +2401,11 @@ function M:init(Storefront)
                 local stop_progress = startDownloadProgress(trap_widget, dl_msg, zip_path, nil)
                 local completed, res = Trapper:dismissableRunInSubprocess(function()
                     local dl_ok, dl_err = downloadToFile(url, zip_path)
-                    return { ok = dl_ok, err = dl_err }
+                    local head_sha
+                    if dl_ok then
+                        head_sha = extractGitHubZipCommitSha(zip_path) or GitHub.fetchBranchSHA(owner, repo_name, branch_name)
+                    end
+                    return { ok = dl_ok, err = dl_err, head_sha = head_sha }
                 end, trap_widget)
                 stop_progress()
 
@@ -2020,14 +2425,24 @@ function M:init(Storefront)
                     end
                     return
                 end
-                doInstall(res and res.ok, res and res.err)
+                doInstall(res and res.ok, res and res.err, res and res.head_sha)
             end)
         end)
     end
 end
 
+M.extractGitHubZipCommitSha = extractGitHubZipCommitSha
 M.downloadToFile = downloadToFile
 M.detectPluginFromArchive = detectPluginFromArchive
 M.extractPluginToUserDir = extractPluginToUserDir
+M.isNativeLibraryPath = isNativeLibraryPath
+M.stageNativeLibrary = stageNativeLibrary
+M.getStagedNativeLibs = getStagedNativeLibs
+M.clearStagedNativeLibs = clearStagedNativeLibs
+M.applyStagedNativeLibs = applyStagedNativeLibs
+M.markNativeLibraryUnlinked = markNativeLibraryUnlinked
+M.hasPendingNativeLibExitHazard = hasPendingNativeLibExitHazard
+M.installSafeExitHook = installSafeExitHook
+M.recoverStagedNativeLibsOnStartup = recoverStagedNativeLibsOnStartup
 
 return M

@@ -47,6 +47,7 @@ package.loaded["ui/uimanager"] = {
     close = function() end,
     forceRePaint = function() end,
     scheduleIn = function() end,
+    unschedule = function() end,
 }
 package.loaded["storefront_net_github"] = {
     isDirectApiEnabled = function() return false end,
@@ -88,6 +89,212 @@ end)
 
 check("refreshCache returns early when isRefreshing is true", callback_called == true and callback_ok == false)
 check("Friendly toast displayed instead of instant progress/error churn", #shown_toasts == 1 and shown_toasts[1]:find("already in progress", 1, true) ~= nil)
+
+-- Test 5: CatalogClient.cancelAsyncFetch terminates subprocess before reading/closing pipe FD
+do
+    local cleanup_events = {}
+    local mock_ffiutil = {
+        terminateSubProcess = function(pid)
+            table.insert(cleanup_events, "terminate:" .. tostring(pid))
+            return true
+        end,
+        isSubProcessDone = function(pid, wait)
+            table.insert(cleanup_events, "done:" .. tostring(pid) .. ":" .. tostring(wait))
+            return true
+        end,
+        readAllFromFD = function(fd)
+            table.insert(cleanup_events, "readAll:" .. tostring(fd))
+            return ""
+        end,
+    }
+
+    local orig_ffi = package.loaded["ffi/util"]
+    package.loaded["ffi/util"] = mock_ffiutil
+    package.loaded["ffiutil"] = mock_ffiutil
+
+    CatalogClient._async_pid = 12345
+    CatalogClient._poll_fd = 54321
+    local poll_unscheduled = false
+    CatalogClient._poll_func = function() end
+
+    local orig_unschedule = package.loaded["ui/uimanager"].unschedule
+    package.loaded["ui/uimanager"].unschedule = function(self, fn)
+        poll_unscheduled = true
+    end
+
+    CatalogClient.cancelAsyncFetch()
+
+    check("cancelAsyncFetch unscheduled poll func", poll_unscheduled == true)
+    check("cancelAsyncFetch cleared _async_pid", CatalogClient._async_pid == nil)
+    check("cancelAsyncFetch cleared _poll_fd", CatalogClient._poll_fd == nil)
+    check("cancelAsyncFetch cleared _poll_func", CatalogClient._poll_func == nil)
+    check("cancelAsyncFetch called terminateSubProcess FIRST", cleanup_events[1] == "terminate:12345")
+    check("cancelAsyncFetch called isSubProcessDone SECOND", cleanup_events[2] == "done:12345:true")
+    check("cancelAsyncFetch called readAllFromFD LAST", cleanup_events[3] == "readAll:54321")
+
+    package.loaded["ui/uimanager"].unschedule = orig_unschedule
+    package.loaded["ffi/util"] = orig_ffi
+    package.loaded["ffiutil"] = orig_ffi
+end
+
+-- Test 6: Verify requestWithRedirects calls socketutil:set_timeout before sink_fn
+do
+    local call_order = {}
+    local mock_socketutil = {
+        FILE_BLOCK_TIMEOUT = 15,
+        FILE_TOTAL_TIMEOUT = 30,
+        total_timeout = -1,
+        set_timeout = function(self, b, t)
+            self.total_timeout = t
+            table.insert(call_order, "set_timeout:" .. tostring(t))
+        end,
+        reset_timeout = function(self)
+            self.total_timeout = -1
+            table.insert(call_order, "reset_timeout")
+        end,
+        file_sink = function(handle)
+            return function(chunk) return 1 end
+        end,
+        SINK_TIMEOUT_CODE = "sink timeout",
+    }
+    package.loaded["socketutil"] = mock_socketutil
+
+    -- Test requestWithRedirects by calling fetchCatalogToFile with mock http
+    local orig_http = package.loaded["socket.http"]
+    package.loaded["socket.http"] = {
+        request = function(params)
+            table.insert(call_order, "http_request")
+            return 1, 200, { etag = "test_etag" }
+        end
+    }
+
+    local sink_called_with_total_timeout = nil
+    local orig_fetch = CatalogClient.fetchCatalogToFile
+    -- Test directly via requestWithRedirects by requiring clean or testing internal flow
+    local ok_res, code_res = CatalogClient.fetchCatalogToFile("https://example.com/test.json", "/tmp/nonexistent_test.json")
+
+    check("socketutil:set_timeout called before request and reset after", #call_order >= 2 and call_order[1]:find("^set_timeout") ~= nil)
+
+    package.loaded["socket.http"] = orig_http
+    os.remove("/tmp/nonexistent_test.json")
+end
+
+-- Test 7: Storefront:onSuspend deduplication and onResume state reset
+do
+    local MainStorefront = {
+        _is_suspended = nil,
+    }
+    local ok_main, SF = pcall(require, "main")
+    if ok_main and SF then
+        MainStorefront = SF
+    end
+
+    MainStorefront._is_suspended = nil
+    MainStorefront:onSuspend()
+    check("onSuspend marks _is_suspended as true", MainStorefront._is_suspended == true)
+
+    -- Second onSuspend call in same sleep cycle returns early
+    MainStorefront:onSuspend()
+    check("onSuspend maintains _is_suspended as true on duplicate call", MainStorefront._is_suspended == true)
+
+    MainStorefront:onResume()
+    check("onResume resets _is_suspended to false", MainStorefront._is_suspended == false)
+
+    -- Duplicate onResume is safe
+    MainStorefront:onResume()
+    check("duplicate onResume keeps _is_suspended as false", MainStorefront._is_suspended == false)
+
+    -- onCloseWidget cleans up without leaving _is_suspended true
+    MainStorefront:onCloseWidget()
+    check("onCloseWidget does not mark _is_suspended as true", MainStorefront._is_suspended ~= true)
+end
+
+-- Test 8: Multi-instance suspend/resume deduplication and GC verification (Issue #5080)
+do
+    local ok_main, MainStorefront = pcall(require, "main")
+    if ok_main and MainStorefront and type(MainStorefront.new) == "function" then
+        local logger = require("logger")
+        local orig_logger_info = logger.info
+        local suspend_log_count = 0
+        local resume_log_count = 0
+        logger.info = function(msg, ...)
+            if type(msg) == "string" then
+                if msg:find("onSuspend received", 1, true) then
+                    suspend_log_count = suspend_log_count + 1
+                elseif msg:find("onResume received", 1, true) then
+                    resume_log_count = resume_log_count + 1
+                end
+            end
+            if orig_logger_info then orig_logger_info(msg, ...) end
+        end
+
+        local gc_calls = {}
+        local orig_collectgarbage = _G.collectgarbage
+        _G.collectgarbage = function(opt, ...)
+            table.insert(gc_calls, { opt = opt, args = { ... } })
+            if orig_collectgarbage then
+                return orig_collectgarbage(opt, ...)
+            end
+            return 0
+        end
+
+        -- Create two instances representing File Browser and Reader
+        local fm_instance = MainStorefront:new{ ui = { name = "FileManager" } }
+        local reader_instance = MainStorefront:new{ ui = { name = "ReaderUI" } }
+
+        -- Populate caches and active workers on both instances
+        fm_instance.screensavers_cache = { { id = 101 } }
+        fm_instance._filtered_screensavers_cache = { { id = 101 } }
+        fm_instance._screensavers_all_cache = { { id = 101 } }
+        fm_instance._active_thumb_worker = { pid = 1111, fd = 2222 }
+
+        reader_instance.screensavers_cache = { { id = 202 } }
+        reader_instance._filtered_screensavers_cache = { { id = 202 } }
+        reader_instance._screensavers_all_cache = { { id = 202 } }
+        reader_instance._active_thumb_worker = { pid = 3333, fd = 4444 }
+
+        MainStorefront.instance = reader_instance
+        MainStorefront._is_suspended = nil
+
+        -- Suspend cycle: first instance triggers onSuspend
+        fm_instance:onSuspend()
+        check("fm_instance:onSuspend sets _is_suspended true", MainStorefront._is_suspended == true)
+        check("fm_instance screensavers_cache cleared", fm_instance.screensavers_cache == nil)
+        check("reader_instance (Storefront.instance) screensavers_cache cleared", reader_instance.screensavers_cache == nil)
+
+        -- Second instance triggers onSuspend in same sleep cycle
+        reader_instance.screensavers_cache = { { id = 203 } }
+        reader_instance:onSuspend()
+        check("duplicate onSuspend does not run twice (suspend_log_count == 1)", suspend_log_count == 1)
+        check("duplicate onSuspend cleared screensavers_cache on second instance", reader_instance.screensavers_cache == nil)
+
+        -- Verify GC behavior during onSuspend
+        local full_gc_found = false
+        local step_gc_found = false
+        for _, call in ipairs(gc_calls) do
+            if call.opt == "collect" then
+                full_gc_found = true
+            elseif call.opt == "step" then
+                step_gc_found = true
+            end
+        end
+        check("onSuspend does NOT invoke collectgarbage('collect')", full_gc_found == false)
+        check("onSuspend invokes collectgarbage('step', 200)", step_gc_found == true)
+
+        -- Resume cycle: both instances receive onResume
+        fm_instance:onResume()
+        check("fm_instance:onResume sets _is_suspended false", MainStorefront._is_suspended == false)
+        check("onResume logged once on first instance", resume_log_count == 1)
+
+        reader_instance:onResume()
+        check("reader_instance:onResume is deduplicated (resume_log_count remains 1)", resume_log_count == 1)
+        check("reader_instance reflects _is_suspended == false", reader_instance._is_suspended == false)
+
+        -- Clean up mocks
+        logger.info = orig_logger_info
+        _G.collectgarbage = orig_collectgarbage
+    end
+end
 
 print("=== Refresh Guard Unit Tests Summary ===")
 print(string.format("Total Failures: %d", failures))

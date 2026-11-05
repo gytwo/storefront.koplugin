@@ -42,16 +42,17 @@ package.loaded["dispatcher"] = {
 
 package.loaded["lfs"] = {
     attributes = function(path, req)
+        local is_file = path and (path:match("%.jpg$") or path:match("%.png$") or path:match("%.lua$") or path:match("%.disabled$") or path:match("%.zip$"))
+        local mode = is_file and "file" or "directory"
+        local size = is_file and 1234 or 4096
         if req == "mode" then
-            if path and (path:match("%.jpg$") or path:match("%.png$") or path:match("%.lua$") or path:match("%.disabled$") or path:match("%.zip$")) then
-                return "file"
-            end
-            return "directory"
+            return mode
+        elseif req == "size" then
+            return size
+        elseif req == "modification" then
+            return os.time()
         end
-        if path and (path:match("%.jpg$") or path:match("%.png$") or path:match("%.lua$") or path:match("%.disabled$") or path:match("%.zip$")) then
-            return { mode = "file", size = 1234, modification = os.time() }
-        end
-        return { mode = "directory", size = 4096, modification = os.time() }
+        return { mode = mode, size = size, modification = os.time() }
     end,
     dir = function(path)
         local dummy_state = { __name = "directory", path = path }
@@ -445,7 +446,22 @@ package.loaded["ui/size"] = {
     span = { vertical_default = 8, horizontal_default = 8 },
 }
 package.loaded["ui/geometry"] = {
-    new = function(a, b) return b or a end
+    new = function(a, b)
+        local obj = b or a or {}
+        function obj:intersectWith(other)
+            if not other then return false end
+            local x1 = self.x or 0
+            local y1 = self.y or 0
+            local w1 = self.w or 0
+            local h1 = self.h or 0
+            local x2 = other.x or 0
+            local y2 = other.y or 0
+            local w2 = other.w or 0
+            local h2 = other.h or 0
+            return not (x1 + w1 < x2 or x2 + w2 < x1 or y1 + h1 < y2 or y2 + h2 < y1)
+        end
+        return obj
+    end
 }
 package.loaded["ui/widget/table"] = {
     new = function(a, b) return { type = "Table", args = b or a } end
@@ -617,7 +633,16 @@ package.loaded["socketutil"] = {
     reset_timeout = function() end,
 }
 package.loaded["ffi/archiver"] = {}
-package.loaded["ffi/sha2"] = {}
+package.loaded["ffi/sha2"] = {
+    sha1 = function(data)
+        -- Lightweight deterministic hash mock for tests
+        local h = 0
+        for i = 1, #data do
+            h = (h * 31 + string.byte(data, i)) % 4294967296
+        end
+        return string.format("%040x", h)
+    end,
+}
 package.loaded["util"] = {
     trim = function(str) return str and str:gsub("^%s*(.-)%s*$", "%1") or "" end,
     split = function(str, sep)
@@ -640,6 +665,19 @@ package.loaded["util"] = {
     joinPath = function(...)
         local parts = {...}
         return table.concat(parts, "/")
+    end,
+    tableDeepCopy = function(orig)
+        local orig_type = type(orig)
+        local copy
+        if orig_type == 'table' then
+            copy = {}
+            for orig_key, orig_value in next, orig, nil do
+                copy[orig_key] = (type(orig_value) == 'table') and package.loaded["util"].tableDeepCopy(orig_value) or orig_value
+            end
+        else
+            copy = orig
+        end
+        return copy
     end,
 }
 package.loaded["ffi/util"] = package.loaded["util"]

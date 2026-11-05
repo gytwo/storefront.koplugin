@@ -199,6 +199,7 @@ do
         fp:close()
         check("staging plugins contains 1 repo", p_data and p_data.repos and #p_data.repos == 1)
         check("staging plugin repo name matches", p_data and p_data.repos[1].name == "testplugin")
+        check("staging plugins fetched_at is set for remote data", p_data and (p_data.fetched_at or 0) > 0)
         os.remove(tmp_plugins)
     end
 
@@ -223,6 +224,21 @@ do
         check("staging font family matches", f_data and f_data.repos[1].font_family == "TestFont")
         os.remove(tmp_fonts)
     end
+
+    -- Bundled fallback must stay stale so the next freshness check refetches
+    CatalogClient.processCatalogDataToStaging({ plugins = { { id = 102, name = "bundledplugin", full_name = "user/bundledplugin" } } }, tmp_plugins, tmp_patches, tmp_fonts, true)
+    local fb = io.open(tmp_plugins, "r")
+    if fb then
+        local b_data = json.decode(fb:read("*a"))
+        fb:close()
+        check("bundled staging plugins fetched_at is 0", b_data and b_data.fetched_at == 0)
+        check("bundled staging repo fetched_at is 0", b_data and b_data.repos and b_data.repos[1] and b_data.repos[1].fetched_at == 0)
+        os.remove(tmp_plugins)
+    else
+        check("bundled staging plugins file exists", false)
+    end
+    os.remove(tmp_patches)
+    os.remove(tmp_fonts)
 end
 
 -- ----------------------------------------------------
@@ -241,6 +257,32 @@ do
     CatalogClient.setStoredReaderBackdropEtag("rb_etag_abc")
     CatalogClient.clearStoredReaderBackdropEtag()
     check("clearStoredReaderBackdropEtag clears readerbackdrop etag", CatalogClient.getStoredReaderBackdropEtag() == nil)
+end
+
+-- ----------------------------------------------------
+-- Test: ETags saved in the catalog subprocess reach the parent's settings
+-- ----------------------------------------------------
+do
+    local StorefrontSettings = require("storefront_settings")
+    StorefrontSettings:delSetting("catalog_etag")
+    StorefrontSettings:delSetting("screensaver_catalog_etag")
+
+    -- Child: ETags go to the sink, not to the forked settings copy
+    CatalogClient._etag_sink = {}
+    CatalogClient.setStoredEtag('W/"main1"')
+    CatalogClient.setStoredScreensaverEtag('"ss1"')
+    check("child does not write ETag to settings", StorefrontSettings:readSetting("catalog_etag") == nil)
+    local msg = "OK:main=updated,ss=updated,rb=not_modified" .. CatalogClient.etagsToChildMsg()
+    CatalogClient._etag_sink = nil
+
+    -- Parent: ETags from the child message are saved
+    CatalogClient.applyEtagsFromChildMsg(msg)
+    check("parent saves main ETag from child msg", CatalogClient.getStoredEtag() == 'W/"main1"')
+    check("parent saves screensaver ETag from child msg", CatalogClient.getStoredScreensaverEtag() == '"ss1"')
+    check("result prefix survives after stripping ETags", msg:gsub("\nETAG [^\n]*", "") == "OK:main=updated,ss=updated,rb=not_modified")
+
+    StorefrontSettings:delSetting("catalog_etag")
+    StorefrontSettings:delSetting("screensaver_catalog_etag")
 end
 
 -- ----------------------------------------------------
@@ -299,6 +341,90 @@ do
         check("getCachedCount resolves stored count without parsing JSON", count == 3170)
     else
         print("SKIP\tstorefront_screensavers_ui not available")
+    end
+end
+
+-- ----------------------------------------------------
+-- Test 9: Cache.getCachedCount resolves counts without calling Cache.init() (Issue #5081)
+-- ----------------------------------------------------
+do
+    local Cache = require("storefront_cache")
+    Cache.purgeMem()
+    check("Cache is unloaded after purgeMem", Cache.isLoaded() == false)
+
+    package.loaded["storefront_settings"] = {
+        readSetting = function(self, key)
+            if key == "cached_plugin_count" then return 142 end
+            if key == "cached_patch_count" then return 57 end
+            if key == "cached_font_count" then return 28 end
+            return nil
+        end,
+        saveSetting = function(self, key, val) end,
+        flush = function() end,
+    }
+
+    local p_count = Cache.getCachedCount("plugin")
+    local pt_count = Cache.getCachedCount("patch")
+    local f_count = Cache.getCachedCount("font")
+
+    check("getCachedCount('plugin') resolves from settings", p_count == 142)
+    check("getCachedCount('patch') resolves from settings", pt_count == 57)
+    check("getCachedCount('font') resolves from settings", f_count == 28)
+    check("Cache remains unloaded after getCachedCount calls", Cache.isLoaded() == false)
+end
+
+-- ----------------------------------------------------
+-- Test 10: Localization:ensureInit idempotency (Issue #5081)
+-- ----------------------------------------------------
+do
+    local Localization = require("localization_storefront")
+    Localization.initialized = true
+    Localization.path = "/test/path"
+    Localization.translations = { btn_install = "Install" }
+
+    local parse_called = false
+    local orig_parse = Localization.parsePO
+    Localization.parsePO = function(...)
+        parse_called = true
+        return {}
+    end
+
+    Localization:ensureInit("/test/path")
+    check("ensureInit does not re-parse translations when already initialized", parse_called == false)
+    Localization.parsePO = orig_parse
+end
+
+-- ----------------------------------------------------
+-- Test 11: Storefront:onCloseWidget preserves Cache and deduplicates (Issue #5081)
+-- ----------------------------------------------------
+do
+    local ok_main, MainStorefront = pcall(require, "main")
+    local Cache = require("storefront_cache")
+    if ok_main and MainStorefront and type(MainStorefront.new) == "function" then
+        -- Initialize Cache so it is loaded in memory
+        Cache.init()
+        check("Cache is loaded initially", Cache.isLoaded() == true)
+
+        local test_inst = MainStorefront:new{ ui = { name = "FileManager" } }
+        local suspend_count = 0
+        local orig_suspend = test_inst.onSuspend
+        test_inst.onSuspend = function(self, is_widget_close)
+            suspend_count = suspend_count + 1
+            orig_suspend(self, is_widget_close)
+        end
+
+        test_inst:onCloseWidget()
+        check("onCloseWidget marks _is_widget_closed", test_inst._is_widget_closed == true)
+        check("onCloseWidget passes is_widget_close=true to onSuspend", suspend_count == 1)
+        check("onCloseWidget preserves module-level Cache", Cache.isLoaded() == true)
+
+        -- Duplicate onCloseWidget on same instance is ignored
+        test_inst:onCloseWidget()
+        check("Duplicate onCloseWidget returns early without calling onSuspend again", suspend_count == 1)
+
+        -- Real device suspend DOES purge Cache
+        test_inst:onSuspend()
+        check("Real device suspend purges module-level Cache", Cache.isLoaded() == false)
     end
 end
 

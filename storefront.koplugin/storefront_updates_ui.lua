@@ -93,9 +93,10 @@ function StorefrontUpdatesUi:init(StorefrontClass)
 
             if is_branch_tracked and has_update then
                 local remote_sha = remote and remote.remote_version
-                local short_l = record.sha and record.sha:sub(1, 7):lower() or ""
+                local has_installed_sha = record.sha and record.sha ~= ""
+                local short_l = has_installed_sha and record.sha:sub(1, 7):lower() or ""
                 local short_r = remote_sha and tostring(remote_sha):sub(1, 7):lower() or ""
-                if (short_l ~= "" and short_l == short_r) or not StorefrontUtils.isShaDifferent(remote_sha, record.sha) then
+                if has_installed_sha and ((short_l ~= "" and short_l == short_r) or not StorefrontUtils.isShaDifferent(remote_sha, record.sha)) then
                     has_update = false
                 end
             end
@@ -104,7 +105,7 @@ function StorefrontUpdatesUi:init(StorefrontClass)
                 local remote_display = remote_ver or _("new")
                 local transition
                 if is_branch_tracked then
-                    local short_local_sha = record.sha and record.sha:sub(1, 7) or ""
+                    local short_local_sha = (record.sha and record.sha ~= "") and record.sha:sub(1, 7) or _("unknown")
                     local remote_sha = remote and remote.remote_version
                     local is_remote_sha = remote_sha and type(remote_sha) == "string" and remote_sha:match("^%x%x%x%x%x%x%x+$")
                     local short_remote_sha = is_remote_sha and remote_sha:sub(1, 7) or ""
@@ -194,7 +195,7 @@ function StorefrontUpdatesUi:init(StorefrontClass)
             end
 
             if has_update and match_search then
-                local local_commit = (record and record.commit) or item.local_sha or ""
+                local local_commit = item.local_sha or (record and (record.sha or record.commit)) or ""
                 local remote_commit = (remote_entry and remote_entry.remote_sha) or item.remote_sha or ""
                 local local_ver = local_commit ~= "" and ("sha " .. local_commit:sub(1, 5)) or _("unknown")
                 local remote_ver = remote_commit ~= "" and ("sha " .. remote_commit:sub(1, 5)) or _("unknown")
@@ -244,11 +245,11 @@ function StorefrontUpdatesUi:init(StorefrontClass)
                         }
                         local patch_entry = {
                             filename = patch.filename,
-                            path = patch.path,
+                            path = (record and record.path) or patch.path,
                             display_path = record and record.path or patch.path,
-                            download_url = record and record.download_url,
+                            download_url = (remote_entry and remote_entry.download_url) or (record and record.download_url),
                             branch = record and record.branch or "HEAD",
-                            sha = record and record.sha,
+                            sha = (remote_entry and remote_entry.remote_sha) or item.remote_sha or (record and record.sha),
                         }
                         local details_dialog = DetailsDialog:new{
                             Storefront = self,

@@ -244,12 +244,13 @@ function UpdatesMgr:init(Storefront)
                     id = record.repo_id,
                     description = record.repo_description,
                 }
+                local remote_entry = item.remote_entry or (sf.patch_updates_state and sf.patch_updates_state.remote_info and sf.patch_updates_state.remote_info[record.filename])
                 local patch_entry = {
                     filename = record.filename,
                     path = record.path,
                     branch = record.branch or "HEAD",
-                    download_url = record.download_url,
-                    sha = record.sha,
+                    download_url = (remote_entry and remote_entry.download_url) or record.download_url,
+                    sha = (remote_entry and remote_entry.remote_sha) or item.remote_sha or record.sha,
                 }
                 sf.pending_patch_install = {
                     mode = "update",
@@ -289,12 +290,34 @@ function UpdatesMgr:init(Storefront)
                 tracked[#tracked + 1] = record
             end
         end
-        if #tracked == 0 then
-            UIManager:show(InfoMessage:new{ text = _("No matched plugins to check."), timeout = 4 })
+
+        local tracked_patches = {}
+        local ok_patch, PatchMgr = pcall(require, "storefront_patch_mgr")
+        if ok_patch and PatchMgr and PatchMgr.isUserPatchEnabled and PatchMgr.isUserPatchEnabled() then
+            local patch_records = (sf.getPatchRecordsMap and sf:getPatchRecordsMap()) or {}
+            local installed_patches = (sf.listInstalledPatches and sf:listInstalledPatches()) or {}
+            local installed_patch_map = {}
+            for _, patch in ipairs(installed_patches) do
+                if patch.filename then
+                    installed_patch_map[patch.filename] = true
+                end
+            end
+            for filename, prec in pairs(patch_records) do
+                if installed_patch_map[filename] and prec.owner and prec.repo and prec.path then
+                    local copy = {}
+                    for k, v in pairs(prec) do copy[k] = v end
+                    copy.filename = filename
+                    tracked_patches[#tracked_patches + 1] = copy
+                end
+            end
+        end
+
+        if #tracked == 0 and #tracked_patches == 0 then
+            UIManager:show(InfoMessage:new{ text = _("No tracked plugins to check."), timeout = 4 })
             return
         end
         -- User explicitly requested manual update check: query GitHub API directly.
-        sf:_scanUpdatesForDirectApi(tracked)
+        sf:_scanUpdatesForDirectApi(tracked, tracked_patches)
     end
 
     Storefront.collectUpdatesForNotification = function(sf)
