@@ -131,31 +131,9 @@ end
 
 local downloadImage
 
-function RepoContent._cleanupActiveDownload()
-    if not RepoContent._active_dl_pid then return end
-
-    local ok_ffi, ffiutil = pcall(require, "ffi/util")
-    if not ok_ffi then ok_ffi, ffiutil = pcall(require, "ffiutil") end
-
-    if ok_ffi and ffiutil then
-        if ffiutil.terminateSubProcess then
-            pcall(ffiutil.terminateSubProcess, RepoContent._active_dl_pid)
-        end
-        if ffiutil.isSubProcessDone then
-            pcall(ffiutil.isSubProcessDone, RepoContent._active_dl_pid, true)
-        end
-        if RepoContent._active_dl_fd then
-            local read_func = ffiutil.readAllFromFD or ffiutil.readFromFD
-            if read_func then
-                pcall(read_func, RepoContent._active_dl_fd)
-            end
-        end
-    end
-
-    RepoContent._active_dl_pid = nil
-    RepoContent._active_dl_fd = nil
-    RepoContent._active_dl_task = nil
-end
+RepoContent.pending_images = {}
+RepoContent.cumulative_page_bytes = 0
+RepoContent.cumulative_uncompressed_bytes = 0
 
 function RepoContent.cancelPendingImages()
     RepoContent._cleanupActiveDownload()
@@ -702,7 +680,7 @@ function RepoContent.fetchReadme(owner, repo)
     return true, path
 end
 
-function RepoContent.fetchReadmeHtml(owner, repo, force_refresh)
+function RepoContent.fetchReadmeHtml(owner, repo, force_refresh, opts)
     if not owner or not repo then
         return false, "missing owner/repo"
     end
@@ -746,6 +724,7 @@ function RepoContent.fetchReadmeHtml(owner, repo, force_refresh)
 
     -- Download inline images locally for MuPDF HTML viewer widget
     local valid_img_count = 0
+    local allow_sync_images = not (opts and opts.skip_sync_images)
     body = body:gsub('(<img[^>]+src=["\'])([^"\']+)(["\'][^>]*>)', function(prefix, raw_url, suffix)
         prefix = stripImgDimensions(prefix)
         suffix = stripImgDimensions(suffix)
@@ -773,6 +752,16 @@ function RepoContent.fetchReadmeHtml(owner, repo, force_refresh)
         local img_dest = dir .. "/" .. img_filename
 
         local cached_sz = lfs.attributes(img_dest, "size") or 0
+
+        -- Synchronously fetch up to the first 4 valid content images at initial README load time (unless skip_sync_images requested)
+        if allow_sync_images and cached_sz == 0 and valid_img_count <= 4 and RepoContent.cumulative_page_bytes < MAX_PAGE_PAYLOAD_BYTES then
+            if type(downloadImage) == "function" then
+                local pcall_ok, dl_ok, final_dest = pcall(downloadImage, url, img_dest)
+                if pcall_ok and dl_ok then
+                    cached_sz = lfs.attributes(img_dest, "size") or 0
+                end
+            end
+        end
 
         if cached_sz > 0 then
             local w_check, h_check = getImageDimensions(img_dest)
